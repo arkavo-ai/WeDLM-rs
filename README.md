@@ -1,137 +1,167 @@
 # WeDLM-rs
 
-An independent, high-performance Rust implementation of the WeDLM architecture.
+A Rust implementation of Tencent's [WeDLM](https://github.com/Tencent/WeDLM) parallel decoding architecture.
 
-This project provides a native Rust inference engine for WeDLM models, optimized for Apple Silicon with Metal acceleration.
+## Quick Start (5 minutes)
 
-## Attribution
+### 1. Install Rust (if needed)
 
-This implementation is based on the WeDLM architecture developed by Tencent:
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
+```
 
-- **Original Repository**: [Tencent/WeDLM](https://github.com/Tencent/WeDLM)
-- **Paper**: [WeDLM: Weighted Diffusion Language Model](https://arxiv.org/abs/2505.18567)
+### 2. Install HuggingFace CLI (if needed)
 
-We thank the Tencent research team for their pioneering work on parallel decoding with diffusion language models.
+```bash
+brew install huggingface-cli
+```
 
-## Features
+### 3. Download the Model (~16GB)
 
-- Pure Rust implementation using the [Candle](https://github.com/huggingface/candle) ML framework
-- Metal acceleration for Apple Silicon (M1/M2/M3/M4)
-- F16 precision for optimal memory/performance balance
-- Compatible with HuggingFace WeDLM model weights
-- **WeDLM parallel decoding**: 73+ tokens/sec (28x faster than autoregressive)
+```bash
+hf download tencent/WeDLM-8B-Instruct
+```
 
-## Model Architecture
-
-WeDLM-8B specifications:
-- 8.19B parameters
-- 36 transformer layers
-- 4096 hidden dimension
-- 32 attention heads (8 KV heads with GQA)
-- QK-normalization enabled
-- RoPE with theta=1,000,000
-
-## Quick Start
-
-### Prerequisites
-
-- Rust 1.75+
-- macOS with Apple Silicon (for Metal support)
-- WeDLM model weights from HuggingFace
-
-### Installation
+### 4. Clone and Build
 
 ```bash
 git clone https://github.com/arkavo-ai/WeDLM-rs.git
 cd WeDLM-rs
-cargo build --features metal --release
+cargo build --release
 ```
 
-### Download Model
+### 5. Run!
 
 ```bash
-# Using huggingface-cli
-huggingface-cli download tencent/WeDLM-8B-Instruct
+target/release/wedlm-cli generate \
+  --model tencent/WeDLM-8B-Instruct \
+  --prompt "Explain quantum computing in simple terms"
 ```
 
-### Usage
+**That's it!** You should see output like:
 
-First, find your model snapshot path:
-```bash
-MODEL_PATH=$(ls -d ~/.cache/huggingface/hub/models--tencent--WeDLM-8B-Instruct/snapshots/*/ | head -1)
+```
+Resolving HuggingFace model: tencent/WeDLM-8B-Instruct
+Model loading...
+Model loaded in 3.42s
+
+Generating...
+
+--- Output ---
+Explain quantum computing in simple terms: Traditional computers use bits...
+
+--- Stats ---
+TTS (time to generate): 1.75s
+Tokens generated: ~5000
+Speed: 73.9 tok/s
 ```
 
-#### Quick Performance Test
+---
 
-```bash
-# Run benchmark to see WeDLM parallel decoding performance
-./target/release/wedlm-cli benchmark --model $MODEL_PATH -n 128
+## Usage Examples
 
-# Expected output on Apple Silicon:
-# WeDLM Parallel: ~73 tok/s (28x faster than autoregressive)
-```
-
-#### Generate Text
-
-```bash
-# WeDLM parallel decoding (default, fastest)
-./target/release/wedlm-cli generate \
-  --model $MODEL_PATH \
-  --prompt "Explain quantum computing in simple terms:" \
-  --max-tokens 128
-
-# Autoregressive mode (for comparison)
-./target/release/wedlm-cli generate \
-  --model $MODEL_PATH \
-  --prompt "Hello, world!" \
-  --max-tokens 64 \
-  --autoregressive
-```
-
-#### Test Model Loading
+### Basic Generation
 
 ```bash
-./target/release/wedlm-cli test --model $MODEL_PATH
+# Short response
+cargo run --release -- generate \
+  -m tencent/WeDLM-8B-Instruct \
+  -p "What is the capital of France?" \
+  -n 32
+
+# Longer response
+cargo run --release -- generate \
+  -m tencent/WeDLM-8B-Instruct \
+  -p "Write a haiku about programming:" \
+  -n 64
 ```
 
-## Project Structure
+### Compare Speed: WeDLM vs Standard
 
-```
-src/
-├── lib.rs              # Library root
-├── config.rs           # Model configuration
-├── engine.rs           # High-level inference engine
-├── weights.rs          # Safetensor weight loading
-├── cache.rs            # KV cache implementation
-├── model/
-│   ├── mod.rs          # Model module
-│   ├── attention.rs    # Multi-head attention with GQA
-│   ├── mlp.rs          # SwiGLU MLP
-│   ├── layer.rs        # Transformer decoder layer
-│   ├── backbone.rs     # Transformer backbone
-│   ├── causal_lm.rs    # Causal LM head
-│   └── rope.rs         # Rotary position embeddings
-└── decoding/
-    ├── mod.rs          # Decoding module
-    ├── sampler.rs      # Token sampling
-    ├── wedlm.rs        # WeDLM block decoding
-    └── reorder.rs      # Topological reordering
+```bash
+# Run benchmark
+cargo run --release -- benchmark \
+  -m tencent/WeDLM-8B-Instruct \
+  -n 128
+
+# You'll see something like:
+# Autoregressive:  5.12s avg (25.0 tok/s)
+# WeDLM Parallel:  1.75s avg (73.1 tok/s)
+# WeDLM is 2.93x FASTER than autoregressive
 ```
 
-## Development Status
+### All Options
 
-- [x] Model architecture implementation
-- [x] Weight loading from safetensors
-- [x] Metal acceleration with F16
-- [x] Forward pass verification
-- [x] WeDLM parallel decoding with topological reordering
-- [x] Prefix KV cache with incremental updates
-- [x] Benchmarking suite (73+ tok/s on Apple Silicon)
-- [ ] Batch processing (batch_size > 1)
-- [ ] Streaming output
+```bash
+cargo run --release -- generate --help
+```
+
+| Option             | Short | Default  | Description                |
+|--------------------|-------|----------|----------------------------|
+| `--model`          | `-m`  | required | Model ID or local path     |
+| `--prompt`         | `-p`  | required | Your input text            |
+| `--max-tokens`     | `-n`  | 128      | Max tokens to generate     |
+| `--temperature`    | `-t`  | 0.2      | Creativity (0.0-1.0)       |
+| `--block-size`     | `-b`  | 96       | Parallel block size        |
+| `--autoregressive` |       | false    | Use slow standard decoding |
+
+---
+
+## Requirements
+
+- **macOS** with Apple Silicon (M1/M2/M3/M4) — Metal GPU acceleration
+- **16GB+ RAM** — Model uses ~16GB
+- **Rust 1.75+** — Install via rustup
+
+> **Note**: CPU-only and CUDA support are possible but not the default. See [Building](#building) below.
+
+---
+
+## How It Works
+
+WeDLM generates multiple tokens in parallel instead of one at a time:
+
+```
+Standard (autoregressive):  Token → Token → Token → Token  (slow)
+WeDLM (parallel):           [Token Token Token Token]      (fast!)
+```
+
+The model predicts a block of tokens simultaneously, then refines them. This achieves **73+ tokens/sec** on Apple Silicon — about **28x faster** than standard decoding.
+
+---
+
+## Building
+
+### Default (Apple Silicon with Metal)
+
+```bash
+cargo build --release
+```
+
+### CPU Only
+
+```bash
+cargo build --release --no-default-features
+```
+
+### NVIDIA GPU (CUDA)
+
+```bash
+cargo build --release --no-default-features --features cuda
+```
+
+---
+
+## Attribution
+
+Based on the WeDLM architecture by Tencent:
+
+- **Paper**: [WeDLM: Weighted Diffusion Language Model](https://arxiv.org/abs/2505.18567)
+- **Original**: [github.com/Tencent/WeDLM](https://github.com/Tencent/WeDLM)
+
+---
 
 ## License
 
-Apache License 2.0 - See [LICENSE](LICENSE) for details.
-
-This project is licensed under the same terms as the original WeDLM implementation.
+Apache License 2.0

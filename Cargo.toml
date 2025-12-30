@@ -34,6 +34,9 @@ half = "2.4"
 # CLI
 clap = { version = "4.5", features = ["derive"] }
 
+# HuggingFace Hub for model resolution
+hf-hub = "0.3"
+
 [features]
 default = ["metal"]
 metal = ["candle-core/metal"]
