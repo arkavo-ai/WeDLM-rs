@@ -5,6 +5,7 @@
 //! where d_i is the distance from slot i to the leftmost remaining mask.
 
 use candle_core::{DType, Result, Tensor, D};
+use rand::prelude::*;
 
 /// Sampling parameters for WeDLM decoding
 #[derive(Clone, Debug)]
@@ -67,18 +68,67 @@ pub fn sample_with_temperature(
     Ok((predictions, max_probs))
 }
 
-/// Sample from logits and compute per-position entropy and margin
+/// Sample from logits with temperature and top-p, computing entropy and margin
+///
+/// Implements proper stochastic sampling per Algorithm 1's Sample(ℓ_i):
+/// 1. Apply temperature scaling: ℓ' = ℓ / T
+/// 2. Compute softmax probabilities
+/// 3. Apply top-p (nucleus) filtering
+/// 4. Sample from the filtered distribution
 ///
 /// # Returns
 /// (predicted_tokens, entropies, margins) where:
-/// - entropies[i] = H(p_i) (prediction entropy)
+/// - predicted_tokens[i] = sampled token for position i
+/// - entropies[i] = H(p_i) (prediction entropy, computed before top-p)
 /// - margins[i] = logit(top1) - logit(top2) (confidence margin)
 pub fn sample_with_entropy(
     logits: &Tensor,
     temperature: f32,
 ) -> Result<(Tensor, Vec<f32>, Vec<f32>)> {
-    // Apply temperature
-    let scaled_logits = if temperature != 1.0 && temperature > 0.0 {
+    sample_with_entropy_and_top_p(logits, temperature, 1.0)
+}
+
+/// Sample from logits with temperature and top-p, computing entropy and margin
+///
+/// # Arguments
+/// * `logits` - Shape [num_positions, vocab_size]
+/// * `temperature` - Temperature for softmax scaling (0 = greedy/argmax)
+/// * `top_p` - Nucleus sampling threshold (1.0 = no filtering)
+pub fn sample_with_entropy_and_top_p(
+    logits: &Tensor,
+    temperature: f32,
+    top_p: f32,
+) -> Result<(Tensor, Vec<f32>, Vec<f32>)> {
+    let (predictions, entropies, margins) = sample_impl(logits, temperature, top_p, true)?;
+    Ok((predictions, entropies, margins.unwrap_or_default()))
+}
+
+/// Sample from logits without computing margins (faster for streaming)
+///
+/// Avoids per-position logit copy to CPU when margins aren't needed.
+pub fn sample_without_margins(
+    logits: &Tensor,
+    temperature: f32,
+    top_p: f32,
+) -> Result<(Tensor, Vec<f32>)> {
+    let (predictions, entropies, _) = sample_impl(logits, temperature, top_p, false)?;
+    Ok((predictions, entropies))
+}
+
+/// Internal sampling implementation
+///
+/// When `compute_margins` is false, skips the expensive per-position logit copy.
+fn sample_impl(
+    logits: &Tensor,
+    temperature: f32,
+    top_p: f32,
+    compute_margins: bool,
+) -> Result<(Tensor, Vec<f32>, Option<Vec<f32>>)> {
+    let num_positions = logits.dim(0)?;
+    let device = logits.device();
+
+    // Apply temperature scaling
+    let scaled_logits = if temperature > 0.0 && temperature != 1.0 {
         (logits / temperature as f64)?
     } else {
         logits.clone()
@@ -86,41 +136,131 @@ pub fn sample_with_entropy(
 
     // Compute softmax probabilities
     let probs = candle_nn::ops::softmax(&scaled_logits, D::Minus1)?;
-
-    // Get predictions (argmax)
-    let predictions = probs.argmax(D::Minus1)?;
+    let probs_f32 = probs.to_dtype(DType::F32)?;
 
     // Compute entropy for each position: H = -sum(p * log(p))
-    let probs_f32 = probs.to_dtype(DType::F32)?;
     let log_probs = (probs_f32.clone() + 1e-10)?.log()?;
-    let neg_entropy = (probs_f32 * log_probs)?;
+    let neg_entropy = (&probs_f32 * log_probs)?;
     let entropy_tensor = neg_entropy.sum(D::Minus1)?.neg()?;
     let entropies: Vec<f32> = entropy_tensor.to_vec1()?;
 
-    // Compute margin for each position: logit(top1) - logit(top2)
-    let logits_f32 = scaled_logits.to_dtype(DType::F32)?;
-    let num_positions = logits_f32.dim(0)?;
-    let mut margins = Vec::with_capacity(num_positions);
+    // Only convert logits to CPU if we need margins
+    let logits_f32 = if compute_margins {
+        Some(scaled_logits.to_dtype(DType::F32)?)
+    } else {
+        None
+    };
+
+    let mut margins = if compute_margins {
+        Some(Vec::with_capacity(num_positions))
+    } else {
+        None
+    };
+    let mut sampled_tokens = Vec::with_capacity(num_positions);
+    let mut rng = rand::thread_rng();
 
     for i in 0..num_positions {
-        let pos_logits = logits_f32.get(i)?;
-        let logits_vec: Vec<f32> = pos_logits.to_vec1()?;
+        let pos_probs: Vec<f32> = probs_f32.get(i)?.to_vec1()?;
 
-        // Find top two logits
-        let mut top1 = f32::NEG_INFINITY;
-        let mut top2 = f32::NEG_INFINITY;
-        for &l in &logits_vec {
-            if l > top1 {
-                top2 = top1;
-                top1 = l;
-            } else if l > top2 {
-                top2 = l;
+        // Compute margin only if requested (avoids logit copy)
+        let top1_idx = if let (Some(ref logits), Some(ref mut m)) = (&logits_f32, &mut margins) {
+            let pos_logits: Vec<f32> = logits.get(i)?.to_vec1()?;
+
+            // Find top two logits for margin calculation
+            let mut top1_logit = f32::NEG_INFINITY;
+            let mut top2_logit = f32::NEG_INFINITY;
+            let mut idx = 0usize;
+            for (j, &l) in pos_logits.iter().enumerate() {
+                if l > top1_logit {
+                    top2_logit = top1_logit;
+                    top1_logit = l;
+                    idx = j;
+                } else if l > top2_logit {
+                    top2_logit = l;
+                }
             }
-        }
-        margins.push(top1 - top2);
+            m.push(top1_logit - top2_logit);
+            Some(idx)
+        } else {
+            None
+        };
+
+        // Sample token
+        let token = if temperature == 0.0 {
+            // Greedy: need argmax from probs
+            if let Some(idx) = top1_idx {
+                idx as u32
+            } else {
+                // Find argmax from probs
+                pos_probs
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i as u32)
+                    .unwrap_or(0)
+            }
+        } else if top_p >= 1.0 {
+            // No nucleus filtering: sample from full distribution
+            sample_from_probs(&pos_probs, &mut rng)
+        } else {
+            // Nucleus (top-p) sampling
+            sample_nucleus(&pos_probs, top_p, &mut rng)
+        };
+        sampled_tokens.push(token as i64);
     }
 
+    // Create predictions tensor
+    let predictions = Tensor::from_vec(sampled_tokens, (num_positions,), device)?;
+
     Ok((predictions, entropies, margins))
+}
+
+/// Sample a token index from a probability distribution
+fn sample_from_probs<R: Rng>(probs: &[f32], rng: &mut R) -> u32 {
+    let r: f32 = rng.gen();
+    let mut cumsum = 0.0;
+    for (idx, &p) in probs.iter().enumerate() {
+        cumsum += p;
+        if r < cumsum {
+            return idx as u32;
+        }
+    }
+    // Fallback to last token (handles floating point rounding)
+    (probs.len() - 1) as u32
+}
+
+/// Sample with nucleus (top-p) filtering
+fn sample_nucleus<R: Rng>(probs: &[f32], top_p: f32, rng: &mut R) -> u32 {
+    // Create (index, probability) pairs and sort by probability descending
+    let mut indexed: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Find smallest set with cumulative probability >= top_p
+    let mut cumsum = 0.0;
+    let mut cutoff_idx = indexed.len();
+    for (i, (_, p)) in indexed.iter().enumerate() {
+        cumsum += p;
+        if cumsum >= top_p {
+            cutoff_idx = i + 1;
+            break;
+        }
+    }
+
+    // Renormalize and sample from the nucleus
+    let nucleus = &indexed[..cutoff_idx];
+    let total: f32 = nucleus.iter().map(|(_, p)| p).sum();
+
+    let r: f32 = rng.gen::<f32>() * total;
+    let mut cumsum = 0.0;
+    for (idx, p) in nucleus {
+        cumsum += p;
+        if r < cumsum {
+            return *idx as u32;
+        }
+    }
+
+    // Fallback to highest probability token
+    indexed[0].0 as u32
 }
 
 /// Select positions to fill using monotonic (left-to-right) acceptance with dual gate

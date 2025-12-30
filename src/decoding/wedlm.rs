@@ -20,7 +20,7 @@ use crate::model::WeDLMForCausalLM;
 use crate::MASK_TOKEN_ID;
 
 use super::reorder::{compute_block_reorder_into, BlockReorderResult};
-use super::sampler::{sample_with_entropy, select_by_entropy_with_distance, select_by_entropy_with_margin, SamplingParams};
+use super::sampler::{sample_with_entropy_and_top_p, sample_without_margins, select_by_entropy_with_distance, select_by_entropy_with_margin, SamplingParams};
 
 /// Entropy threshold for reducing block size (soft limit)
 pub const ENTROPY_SOFT_THRESHOLD: f32 = 8.0;
@@ -175,7 +175,7 @@ impl<'a> WeDLMDecoder<'a> {
 
             // Sample with entropy and margin calculation for dual-gate selection
             let (predictions, entropies, margins) =
-                sample_with_entropy(&mask_logits, params.temperature)?;
+                sample_with_entropy_and_top_p(&mask_logits, params.temperature, params.top_p)?;
 
             // Get original block positions for MASK tokens (for ordering)
             // MASKs are at the end of block_permutation after reordering
@@ -498,8 +498,8 @@ impl<'a> WeDLMDecoder<'a> {
             let logits_2d = logits.squeeze(0)?;
             let mask_logits = logits_2d.narrow(0, num_filled, num_mask)?;
 
-            let (predictions, entropies, _margins) =
-                sample_with_entropy(&mask_logits, params.temperature)?;
+            let (predictions, entropies) =
+                sample_without_margins(&mask_logits, params.temperature, params.top_p)?;
 
             // mask_logical_indices are BEFORE we drained n_commit tokens
             // We need to adjust indices for the positions AFTER commit
