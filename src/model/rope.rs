@@ -10,8 +10,10 @@ use candle_core::{DType, Device, Result, Tensor, D};
 /// Precomputed rotary position embeddings
 pub struct RotaryEmbedding {
     /// Inverse frequencies: [head_dim / 2]
+    #[allow(dead_code)]
     inv_freq: Tensor,
     /// Head dimension
+    #[allow(dead_code)]
     head_dim: usize,
     /// Maximum sequence length for cached values
     max_seq_len: usize,
@@ -68,7 +70,7 @@ impl RotaryEmbedding {
     fn compute_cos_sin(
         inv_freq: &Tensor,
         seq_len: usize,
-        head_dim: usize,
+        _head_dim: usize,
         dtype: DType,
         device: &Device,
     ) -> Result<(Tensor, Tensor)> {
@@ -94,7 +96,7 @@ impl RotaryEmbedding {
         Ok((cos, sin))
     }
 
-    /// Get cos/sin for specific positions
+    /// Get cos/sin for sequential positions starting at offset
     ///
     /// # Arguments
     /// * `seq_len` - Length of current sequence
@@ -112,6 +114,32 @@ impl RotaryEmbedding {
 
         let cos = self.cos_cache.narrow(0, offset, seq_len)?;
         let sin = self.sin_cache.narrow(0, offset, seq_len)?;
+
+        Ok((cos, sin))
+    }
+
+    /// Get cos/sin for explicit position indices (for WeDLM parallel decoding)
+    ///
+    /// This allows non-sequential positions, e.g., for topologically reordered tokens
+    /// where token at sequence index 0 might have position 5.
+    ///
+    /// # Arguments
+    /// * `positions` - Tensor of position indices [seq_len] or [batch, seq_len]
+    ///
+    /// # Returns
+    /// (cos, sin) tensors with shape matching positions + [head_dim]
+    pub fn get_cos_sin_for_positions(&self, positions: &Tensor) -> Result<(Tensor, Tensor)> {
+        // Flatten positions if needed
+        let pos_1d = if positions.dims().len() == 2 {
+            positions.squeeze(0)?
+        } else {
+            positions.clone()
+        };
+
+        // Use index_select to gather cos/sin for specific positions
+        let pos_u32 = pos_1d.to_dtype(DType::U32)?;
+        let cos = self.cos_cache.index_select(&pos_u32, 0)?;
+        let sin = self.sin_cache.index_select(&pos_u32, 0)?;
 
         Ok((cos, sin))
     }
@@ -145,10 +173,18 @@ impl RotaryEmbedding {
     /// Apply rotary embedding to a single tensor
     fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         // x shape: [batch, heads, seq, head_dim]
-        // CRITICAL: q_embed = (q * cos) + (rotate_half(q) * sin)
-        let x_rotated = rotate_half(x)?;
-        let result = (x.broadcast_mul(cos)? + x_rotated.broadcast_mul(sin)?)?;
-        Ok(result)
+        // CRITICAL: Compute in f32 for numerical stability (matches Python)
+        let input_dtype = x.dtype();
+        let x_f32 = x.to_dtype(DType::F32)?;
+        let cos_f32 = cos.to_dtype(DType::F32)?;
+        let sin_f32 = sin.to_dtype(DType::F32)?;
+
+        // q_embed = (q * cos) + (rotate_half(q) * sin)
+        let x_rotated = rotate_half(&x_f32)?;
+        let result = (x_f32.broadcast_mul(&cos_f32)? + x_rotated.broadcast_mul(&sin_f32)?)?;
+
+        // Convert back to original dtype
+        result.to_dtype(input_dtype)
     }
 }
 

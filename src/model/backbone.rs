@@ -114,6 +114,8 @@ impl WeDLMModel {
     /// * `input_ids` - Token IDs [batch, seq_len]
     /// * `position_offset` - Starting position for RoPE (for incremental decoding)
     /// * `kv_caches` - Optional KV caches for each layer
+    /// * `positions` - Optional explicit position indices [batch, seq_len] for WeDLM
+    ///                 If None, uses sequential positions starting at position_offset
     ///
     /// # Returns
     /// (hidden_states, new_kv_caches)
@@ -123,32 +125,58 @@ impl WeDLMModel {
         position_offset: usize,
         kv_caches: Option<&[Option<(Tensor, Tensor)>]>,
     ) -> Result<(Tensor, Vec<(Tensor, Tensor)>)> {
-        let (batch_size, seq_len) = input_ids.dims2()?;
+        self.forward_with_positions(input_ids, position_offset, kv_caches, None, None)
+    }
+
+    /// Forward pass with explicit position indices (for WeDLM parallel decoding)
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs [batch, seq_len]
+    /// * `position_offset` - Starting position for RoPE (ignored if positions provided)
+    /// * `kv_caches` - Optional KV caches for each layer
+    /// * `positions` - Optional explicit position indices [batch, seq_len] for WeDLM
+    /// * `attention_mask` - Optional custom attention mask (if None, uses causal mask)
+    pub fn forward_with_positions(
+        &self,
+        input_ids: &Tensor,
+        position_offset: usize,
+        kv_caches: Option<&[Option<(Tensor, Tensor)>]>,
+        positions: Option<&Tensor>,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<(Tensor, Vec<(Tensor, Tensor)>)> {
+        let (_batch_size, seq_len) = input_ids.dims2()?;
 
         // Get embeddings
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
 
-        // Get RoPE cos/sin for current positions
-        let (cos, sin) = self.rope.get_cos_sin(seq_len, position_offset)?;
-
-        // Create causal attention mask
-        let kv_len = match kv_caches {
-            Some(caches) => {
-                if let Some(Some((k, _))) = caches.first() {
-                    k.dim(2)? + seq_len
-                } else {
-                    seq_len
-                }
-            }
-            None => seq_len,
+        // Get RoPE cos/sin - use explicit positions if provided
+        let (cos, sin) = match positions {
+            Some(pos) => self.rope.get_cos_sin_for_positions(pos)?,
+            None => self.rope.get_cos_sin(seq_len, position_offset)?,
         };
 
-        let attention_mask = create_causal_mask(
-            seq_len,
-            kv_len,
-            self.config.candle_dtype(),
-            input_ids.device(),
-        )?;
+        // Use provided attention mask or create default causal mask
+        let attention_mask = match attention_mask {
+            Some(mask) => mask.clone(),
+            None => {
+                let kv_len = match kv_caches {
+                    Some(caches) => {
+                        if let Some(Some((k, _))) = caches.first() {
+                            k.dim(2)? + seq_len
+                        } else {
+                            seq_len
+                        }
+                    }
+                    None => seq_len,
+                };
+                create_causal_mask(
+                    seq_len,
+                    kv_len,
+                    self.config.candle_dtype(),
+                    input_ids.device(),
+                )?
+            }
+        };
 
         // Process through all layers
         let mut new_kv_caches = Vec::with_capacity(self.layers.len());

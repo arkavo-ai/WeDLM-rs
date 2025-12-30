@@ -18,9 +18,16 @@ pub struct ReorderResult {
 }
 
 /// Topological reordering: move non-MASK tokens to front, MASK tokens to end
+///
+/// # Arguments
+/// * `input_ids` - Token IDs [batch, seq_len]
+/// * `mask_positions` - Explicit set of positions that are MASKs (absolute indices)
+///
+/// Using explicit mask positions avoids the issue where a predicted token
+/// happens to equal the MASK token ID.
 pub fn topological_reorder(
     input_ids: &Tensor,
-    mask_token_id: u32,
+    mask_positions: &[usize],
 ) -> Result<ReorderResult> {
     let (batch_size, seq_len) = input_ids.dims2()?;
 
@@ -29,15 +36,27 @@ pub fn topological_reorder(
         return Err(Error::Msg("topological_reorder only supports batch_size=1".to_string()));
     }
 
-    let ids: Vec<u32> = input_ids.squeeze(0)?.to_vec1()?;
+    // Handle both I64 and U32 input dtypes
+    let ids: Vec<u32> = match input_ids.dtype() {
+        candle_core::DType::I64 => input_ids
+            .squeeze(0)?
+            .to_vec1::<i64>()?
+            .iter()
+            .map(|&x| x as u32)
+            .collect(),
+        _ => input_ids.squeeze(0)?.to_vec1()?,
+    };
     let device = input_ids.device();
+
+    // Convert mask_positions to a set for O(1) lookup
+    let mask_set: std::collections::HashSet<usize> = mask_positions.iter().copied().collect();
 
     // Partition into known (non-MASK) and unknown (MASK) positions
     let mut known_indices: Vec<usize> = Vec::new();
     let mut unknown_indices: Vec<usize> = Vec::new();
 
-    for (i, &token_id) in ids.iter().enumerate() {
-        if token_id == mask_token_id {
+    for i in 0..seq_len {
+        if mask_set.contains(&i) {
             unknown_indices.push(i);
         } else {
             known_indices.push(i);
@@ -96,7 +115,6 @@ pub fn reorder_kv_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::DType;
 
     #[test]
     fn test_topological_reorder() -> Result<()> {
@@ -104,13 +122,33 @@ mod tests {
         // [known, MASK, known, MASK] -> [known, known, MASK, MASK]
         let ids = Tensor::from_vec(vec![1u32, 151666, 2, 151666], (1, 4), &device)?;
 
-        let result = topological_reorder(&ids, 151666)?;
+        // Explicitly specify mask positions (1 and 3)
+        let mask_positions = vec![1, 3];
+        let result = topological_reorder(&ids, &mask_positions)?;
 
         assert_eq!(result.num_known, 2);
         assert_eq!(result.permutation, vec![0, 2, 1, 3]);
 
         let reordered: Vec<u32> = result.reordered_ids.squeeze(0)?.to_vec1()?;
         assert_eq!(reordered, vec![1, 2, 151666, 151666]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reorder_ignores_token_value() -> Result<()> {
+        let device = Device::Cpu;
+        // Token at position 1 happens to be 151666 (MASK ID) but is NOT a mask
+        // Only position 3 is actually a mask
+        let ids = Tensor::from_vec(vec![1u32, 151666, 2, 151666], (1, 4), &device)?;
+
+        // Only position 3 is a mask
+        let mask_positions = vec![3];
+        let result = topological_reorder(&ids, &mask_positions)?;
+
+        // Position 1 should be treated as known (even though it has MASK token ID)
+        assert_eq!(result.num_known, 3);
+        assert_eq!(result.permutation, vec![0, 1, 2, 3]); // Only pos 3 moves to end
 
         Ok(())
     }

@@ -106,8 +106,8 @@ impl WeDLMEngine {
             &self.device,
         )?;
 
-        // Create decoder
-        let decoder = WeDLMDecoder::new(&self.model, Some(MASK_TOKEN_ID));
+        // Create decoder (mutable for prefix caching)
+        let mut decoder = WeDLMDecoder::new(&self.model, Some(MASK_TOKEN_ID));
 
         // Generate
         let block_size = crate::DEFAULT_BLOCK_SIZE;

@@ -57,7 +57,9 @@ pub fn select_confident_positions(
     threshold: f32,
     max_positions: usize,
 ) -> Result<Vec<usize>> {
-    let conf_vec: Vec<f32> = confidences.to_vec1()?;
+    // Convert to F32 if needed (model outputs F16 on Metal)
+    let conf_f32 = confidences.to_dtype(candle_core::DType::F32)?;
+    let conf_vec: Vec<f32> = conf_f32.to_vec1()?;
 
     // Find positions above threshold
     let mut candidates: Vec<(usize, f32)> = conf_vec

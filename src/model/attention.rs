@@ -260,6 +260,57 @@ pub fn create_causal_mask(
     mask.unsqueeze(0)?.unsqueeze(0)
 }
 
+/// Create a WeDLM attention mask for parallel decoding
+///
+/// After topological reordering, the sequence is [filled tokens..., MASK tokens...].
+/// - Filled tokens attend causally to each other
+/// - MASK tokens attend to ALL filled tokens but NOT to each other
+///
+/// # Arguments
+/// * `seq_len` - Length of query sequence (block tokens only)
+/// * `kv_len` - Length of key sequence (prefix + block)
+/// * `num_filled_in_block` - Number of filled (non-MASK) tokens in the block
+/// * `dtype` - Data type for the mask
+/// * `device` - Device to place the mask on
+pub fn create_wedlm_mask(
+    seq_len: usize,
+    kv_len: usize,
+    num_filled_in_block: usize,
+    dtype: DType,
+    device: &Device,
+) -> Result<Tensor> {
+    // Query positions [0, seq_len) correspond to reordered block tokens
+    // KV positions [0, kv_len) correspond to [prefix..., block...]
+    // prefix_len = kv_len - seq_len
+    let prefix_len = kv_len - seq_len;
+
+    let mut mask_data = vec![0.0f32; seq_len * kv_len];
+    for i in 0..seq_len {
+        for j in 0..kv_len {
+            let is_query_mask = i >= num_filled_in_block;
+            let is_key_in_prefix = j < prefix_len;
+            let is_key_filled_in_block = j >= prefix_len && j < prefix_len + num_filled_in_block;
+
+            let can_attend = if is_query_mask {
+                // MASK token: can only attend to prefix + filled block tokens
+                is_key_in_prefix || is_key_filled_in_block
+            } else {
+                // Filled token: standard causal attention
+                // Can attend to prefix + earlier filled tokens in block
+                let key_block_idx = j as i64 - prefix_len as i64;
+                is_key_in_prefix || (key_block_idx >= 0 && key_block_idx <= i as i64)
+            };
+
+            if !can_attend {
+                mask_data[i * kv_len + j] = f32::NEG_INFINITY;
+            }
+        }
+    }
+
+    let mask = Tensor::from_vec(mask_data, (seq_len, kv_len), device)?.to_dtype(dtype)?;
+    mask.unsqueeze(0)?.unsqueeze(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

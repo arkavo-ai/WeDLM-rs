@@ -30,44 +30,60 @@ High-performance Rust inference engine for WeDLM-8B using Candle, targeting Appl
 - [x] CPU embedding lookup (Metal lacks F16 index_select)
 - [x] U32 indices for all index operations
 - [x] F16 precision throughout (BF16 has gaps in Metal support)
+- [x] F16→F32 conversion for confidence extraction in sampler
+- [x] I64→U32 handling in topological reorder
 
-## Remaining Work
-
-### Phase 3: WeDLM Block Decoding
-- [ ] **Topological reordering integration**
+### Phase 3: WeDLM Block Decoding ✅
+- [x] **Topological reordering integration**
   - Reorder input sequence: known tokens first, MASK tokens last
   - Build permutation and inverse permutation mappings
-  - Apply to KV cache during generation
 
-- [ ] **Block-parallel generation**
+- [x] **Explicit position handling for RoPE**
+  - `get_cos_sin_for_positions()` - look up RoPE by explicit position indices
+  - `forward_with_positions()` - model forward with position tensor
+  - Each reordered token uses its TRUE absolute position for RoPE
+  - RoPE computed in f32 for numerical stability (matching Python)
+
+- [x] **Block-parallel generation**
   - Generate multiple tokens per forward pass
   - Append MASK tokens to prompt
   - Predict all MASK positions simultaneously
+  - **Uses standard causal attention** (matching Python's FlashAttn with causal=True)
 
-- [ ] **Confidence-based acceptance**
+- [x] **Confidence-based acceptance**
   - Compute per-token confidence from softmax probabilities
   - Accept tokens above confidence threshold
   - Re-mask low-confidence positions for next iteration
 
-- [ ] **Iterative refinement loop**
+- [x] **Iterative refinement loop**
   - Continue until all positions accepted or max iterations
   - Handle partial acceptance (some tokens accepted, others re-masked)
 
-### Phase 4: KV Cache Optimization
-- [ ] **Incremental KV cache**
-  - Cache keys/values from previous forward passes
-  - Only compute attention for new tokens
-  - Proper cache management for reordering
+### Phase 4: Prefix Caching ✅ (Partial)
+- [x] **Stable prefix caching**
+  - Cache K/V for prefix tokens (prompt) where positions never change
+  - `cache_prefix()` computes and stores prefix K/V
+  - Block forward passes use cached prefix with new block tokens
+  - `commit_block_to_cache()` after block completion
 
-- [ ] **Cache reordering for WeDLM**
-  - Reorder cached KV states when permutation changes
-  - Handle cache invalidation on re-masking
+- [ ] **RoPE-free intra-block caching** (Not implemented)
+  - Would store K/V without RoPE, apply dynamically
+  - Requires significant refactor of attention mechanism
+  - Current approach: full block recomputation each iteration
 
-- [ ] **Memory optimization**
-  - Pre-allocate cache for max sequence length
-  - Efficient cache update patterns
+## Remaining Work
+
+### Known Issues (Resolved)
+- [x] **Mask detection now uses explicit positions** (`src/decoding/reorder.rs`)
+  - Fixed: `topological_reorder()` now takes `mask_positions: &[usize]`
+  - Decoder passes absolute mask positions instead of relying on token value
+  - Added test `test_reorder_ignores_token_value` to verify
 
 ### Phase 5: Performance & Polish
+- [ ] **Parity testing**
+  - Compare Rust vs Python logits for synthetic inputs
+  - Verify explicit position handling matches Python exactly
+
 - [ ] **Benchmarking suite**
   - Tokens per second measurement
   - Memory usage tracking
@@ -112,13 +128,33 @@ High-performance Rust inference engine for WeDLM-8B using Candle, targeting Appl
    - theta = 1,000,000 (high for long context)
    - head_dim = 128 → 64 inverse frequencies
    - Formula: `inv_freq[i] = 1.0 / (theta ^ (2*i / head_dim))`
+   - **Compute in f32** for numerical stability, then convert back
 
-3. **Metal Limitations**:
+3. **WeDLM Decode Flow** (matching Python):
+   - Topological reorder: filled tokens first, MASKs last
+   - Build explicit position tensor with TRUE absolute positions
+   - Forward with cached prefix K/V + new block tokens
+   - **Standard causal attention** (Python uses FlashAttn causal=True)
+   - Extract logits for MASK positions only
+   - Confidence-based filling
+
+4. **Metal Limitations**:
    - No F16/BF16 index_select → use CPU for embeddings
    - Use U32 for all index tensors
    - F16 preferred over BF16 (better Metal support)
 
-4. **MASK Token**: ID 151666 (already in WeDLM tokenizer)
+5. **MASK Token**: ID 151666 (already in WeDLM tokenizer)
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `src/model/rope.rs` | RoPE with explicit position support, f32 compute |
+| `src/model/backbone.rs` | `forward_with_positions()` for explicit positions |
+| `src/model/causal_lm.rs` | High-level model with position/mask forwarding |
+| `src/decoding/wedlm.rs` | Block decoder with topological reorder |
+| `src/decoding/reorder.rs` | Topological reordering logic |
+| `src/decoding/sampler.rs` | Confidence-based sampling |
 
 ### Model Specifications
 

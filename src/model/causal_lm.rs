@@ -55,6 +55,29 @@ impl WeDLMForCausalLM {
         Ok((logits, new_kv_caches))
     }
 
+    /// Forward pass with explicit position indices (for WeDLM parallel decoding)
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs [batch, seq_len]
+    /// * `positions` - Explicit position indices [batch, seq_len]
+    /// * `kv_caches` - Optional KV caches for each layer
+    /// * `attention_mask` - Optional custom attention mask
+    ///
+    /// # Returns
+    /// (logits, new_kv_caches) where logits is [batch, seq_len, vocab_size]
+    pub fn forward_with_positions(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        kv_caches: Option<&[Option<(Tensor, Tensor)>]>,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<(Tensor, Vec<(Tensor, Tensor)>)> {
+        let (hidden_states, new_kv_caches) =
+            self.model.forward_with_positions(input_ids, 0, kv_caches, Some(positions), attention_mask)?;
+        let logits = self.lm_head.forward(&hidden_states)?;
+        Ok((logits, new_kv_caches))
+    }
+
     /// Get logits only for the last token (for efficient autoregressive generation)
     ///
     /// # Returns
