@@ -357,13 +357,15 @@ impl<'a> WeDLMDecoder<'a> {
         let mut window_positions: Vec<usize> = (next_pos..next_pos + window_size).collect();
         next_pos += window_size;
 
-        // Pre-allocate reusable buffers
+        // Pre-allocate reusable buffers to avoid per-iteration allocations
         let mut reorder = BlockReorderResult {
             reordered_block: Vec::with_capacity(window_size * 2),
             positions: Vec::with_capacity(window_size * 2),
             block_permutation: Vec::with_capacity(window_size * 2),
             num_filled: 0,
         };
+        let mut mask_logical_indices: Vec<usize> = Vec::with_capacity(window_size);
+        let mut reordered_pos: Vec<i64> = Vec::with_capacity(window_size);
 
         // Main generation loop
         while output_tokens.len() < max_new_tokens {
@@ -383,12 +385,14 @@ impl<'a> WeDLMDecoder<'a> {
             // Committed tokens are part of filled - their K/V will be
             // computed in this forward pass and kept in cache
             // ============================================================
-            let mask_logical_indices: Vec<usize> = window_tokens
-                .iter()
-                .enumerate()
-                .filter(|(_, &t)| t == self.mask_token_id as i64)
-                .map(|(i, _)| i)
-                .collect();
+            mask_logical_indices.clear();
+            mask_logical_indices.extend(
+                window_tokens
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &t)| t == self.mask_token_id as i64)
+                    .map(|(i, _)| i),
+            );
 
             let current_window_size = window_tokens.len();
 
@@ -405,11 +409,13 @@ impl<'a> WeDLMDecoder<'a> {
             );
 
             // Build reordered positions using window_positions
-            let reordered_pos: Vec<i64> = reorder
-                .block_permutation
-                .iter()
-                .map(|&i| window_positions[i] as i64)
-                .collect();
+            reordered_pos.clear();
+            reordered_pos.extend(
+                reorder
+                    .block_permutation
+                    .iter()
+                    .map(|&i| window_positions[i] as i64),
+            );
 
             // Upload to GPU
             let reordered_tokens_tensor = Tensor::from_slice(
