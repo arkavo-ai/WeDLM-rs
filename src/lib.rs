@@ -18,4 +18,5 @@ pub use engine::WeDLMEngine;
 pub const MASK_TOKEN_ID: u32 = 151666;
 
 /// Default block size for WeDLM generation
-pub const DEFAULT_BLOCK_SIZE: usize = 8;
+/// Sweep testing shows block_size=32 with aggressive acceptance gives ~20x speedup
+pub const DEFAULT_BLOCK_SIZE: usize = 32;

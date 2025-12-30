@@ -20,8 +20,10 @@ impl Default for SamplingParams {
         Self {
             temperature: 0.2,
             top_p: 0.9,
-            confidence_threshold: 0.8,
-            max_tokens_per_step: 8,
+            // Lower threshold = more aggressive acceptance = more parallelism
+            // Sweep testing: 0.5 threshold with block_size=32 gives ~20x speedup
+            confidence_threshold: 0.5,
+            max_tokens_per_step: 32,
         }
     }
 }

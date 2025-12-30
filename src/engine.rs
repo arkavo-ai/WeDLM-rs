@@ -89,6 +89,17 @@ impl WeDLMEngine {
         max_new_tokens: usize,
         params: Option<SamplingParams>,
     ) -> Result<String> {
+        self.generate_with_block_size(prompt, max_new_tokens, crate::DEFAULT_BLOCK_SIZE, params)
+    }
+
+    /// Generate text using WeDLM block decoding with custom block size
+    pub fn generate_with_block_size(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        block_size: usize,
+        params: Option<SamplingParams>,
+    ) -> Result<String> {
         let params = params.unwrap_or_default();
 
         // Tokenize input
@@ -98,7 +109,7 @@ impl WeDLMEngine {
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
         let prompt_ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
 
-        tracing::debug!("Prompt tokens: {}", prompt_ids.len());
+        tracing::debug!("Prompt tokens: {}, block_size: {}", prompt_ids.len(), block_size);
 
         let prompt_tensor = candle_core::Tensor::from_vec(
             prompt_ids.clone(),
@@ -110,7 +121,6 @@ impl WeDLMEngine {
         let mut decoder = WeDLMDecoder::new(&self.model, Some(MASK_TOKEN_ID));
 
         // Generate
-        let block_size = crate::DEFAULT_BLOCK_SIZE;
         let output_ids = decoder.generate(&prompt_tensor, max_new_tokens, block_size, &params)?;
 
         // Decode output

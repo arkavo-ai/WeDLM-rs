@@ -95,15 +95,32 @@ impl WeDLMConfig {
     }
 
     /// Get the candle DType based on config
-    /// Note: We default to F16 for Metal compatibility (full index_select support)
+    /// - If config says float32, always return F32 (for parity testing on CPU)
+    /// - On Metal, return F16 (BF16 lacks full support)
+    /// - Otherwise, parse the config dtype
     pub fn candle_dtype(&self) -> DType {
-        match self.dtype.to_lowercase().as_str() {
+        // First parse what the config says
+        let config_dtype = match self.dtype.to_lowercase().as_str() {
             "float32" | "f32" => DType::F32,
             "float16" | "f16" | "half" => DType::F16,
             "bfloat16" | "bf16" => DType::BF16,
-            // Default to F16 for Metal compatibility (BF16 lacks full support)
-            _ => DType::F16,
+            _ => DType::F32,
+        };
+
+        // If config explicitly says F32, honor it (for parity testing)
+        if config_dtype == DType::F32 {
+            return DType::F32;
         }
+
+        // On Metal, use F16 for full compatibility (BF16 lacks index_select)
+        #[cfg(feature = "metal")]
+        {
+            if candle_core::utils::metal_is_available() {
+                return DType::F16;
+            }
+        }
+
+        config_dtype
     }
 
     /// Create a default config matching WeDLM-8B-Instruct
