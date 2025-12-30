@@ -353,9 +353,11 @@ impl<'a> WeDLMDecoder<'a> {
         let mut output_tokens: Vec<i64> = Vec::new();          // All committed output tokens
 
         // 2. Initialize window with MASKs at positions [prefix_len, prefix_len + window_size)
-        let mut window_tokens: Vec<i64> = vec![self.mask_token_id as i64; window_size];
-        let mut window_positions: Vec<usize> = (next_pos..next_pos + window_size).collect();
-        next_pos += window_size;
+        // Clamp to max_new_tokens to avoid exceeding the limit
+        let initial_window = window_size.min(max_new_tokens);
+        let mut window_tokens: Vec<i64> = vec![self.mask_token_id as i64; initial_window];
+        let mut window_positions: Vec<usize> = (next_pos..next_pos + initial_window).collect();
+        next_pos += initial_window;
 
         // Pre-allocate reusable buffers to avoid per-iteration allocations
         let mut reorder = BlockReorderResult {
@@ -447,9 +449,11 @@ impl<'a> WeDLMDecoder<'a> {
             self.prefix_cache_len = committed_len + current_window_size;
 
             // ============================================================
-            // STEP D: Truncate cache to keep committed K/V, discard MASK K/V
-            // committed_len + n_commit = positions for real tokens only
+            // STEP D: Cap n_commit to remaining capacity to avoid exceeding max_new_tokens
+            // Then truncate cache to keep committed K/V, discard MASK K/V
             // ============================================================
+            let remaining = max_new_tokens.saturating_sub(output_tokens.len());
+            let n_commit = n_commit.min(remaining);
             let new_committed_len = committed_len + n_commit;
             self.truncate_cache(new_committed_len)?;
 
