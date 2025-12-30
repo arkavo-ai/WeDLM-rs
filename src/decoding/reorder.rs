@@ -53,7 +53,7 @@ pub fn compute_block_reorder(
     result
 }
 
-/// Compute block reordering into pre-allocated buffers (zero allocation in hot loop)
+/// Compute block reordering into pre-allocated buffers (zero heap allocation)
 pub fn compute_block_reorder_into(
     block_tokens: &[i64],
     mask_positions: &[usize],
@@ -61,7 +61,6 @@ pub fn compute_block_reorder_into(
     result: &mut BlockReorderResult,
 ) {
     let block_size = block_tokens.len();
-    let mask_set: std::collections::HashSet<usize> = mask_positions.iter().copied().collect();
 
     // Clear and reuse buffers
     result.reordered_block.clear();
@@ -69,19 +68,18 @@ pub fn compute_block_reorder_into(
     result.block_permutation.clear();
 
     // Partition: filled positions first, then mask positions
+    // Use linear scan instead of HashSet - faster for small N (block_size <= 32)
     // First pass: add filled indices
     for i in 0..block_size {
-        if !mask_set.contains(&i) {
+        if !mask_positions.contains(&i) {
             result.block_permutation.push(i);
         }
     }
     result.num_filled = result.block_permutation.len();
 
-    // Second pass: add mask indices
-    for i in 0..block_size {
-        if mask_set.contains(&i) {
-            result.block_permutation.push(i);
-        }
+    // Second pass: add mask indices (just append mask_positions in order)
+    for &pos in mask_positions {
+        result.block_permutation.push(pos);
     }
 
     // Build reordered tokens and positions from permutation
@@ -102,14 +100,14 @@ pub fn topological_reorder_cpu(
     mask_positions: &[usize],
 ) -> ReorderResult {
     let seq_len = ids.len();
-    let mask_set: std::collections::HashSet<usize> = mask_positions.iter().copied().collect();
 
     // Partition into known (non-MASK) and unknown (MASK) positions
+    // Use linear scan - faster for small mask_positions (typically <= 32)
     let mut known_indices: Vec<usize> = Vec::new();
     let mut unknown_indices: Vec<usize> = Vec::new();
 
     for i in 0..seq_len {
-        if mask_set.contains(&i) {
+        if mask_positions.contains(&i) {
             unknown_indices.push(i);
         } else {
             known_indices.push(i);

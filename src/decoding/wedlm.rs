@@ -192,9 +192,8 @@ impl<'a> WeDLMDecoder<'a> {
             }
 
             // Remove filled positions from mask tracking
-            let filled_set: std::collections::HashSet<usize> =
-                positions_to_fill.iter().map(|(p, _)| *p).collect();
-            mask_positions.retain(|p| !filled_set.contains(p));
+            // Use linear scan instead of HashSet - faster for small N (max 32 elements)
+            mask_positions.retain(|p| !positions_to_fill.iter().any(|(pos, _)| pos == p));
 
             // Check for EOS
             if positions_to_fill
