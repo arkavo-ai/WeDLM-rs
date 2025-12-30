@@ -19,7 +19,7 @@ use candle_core::{DType, Result, Tensor};
 use crate::model::WeDLMForCausalLM;
 use crate::MASK_TOKEN_ID;
 
-use super::reorder::topological_reorder;
+use super::reorder::compute_block_reorder;
 use super::sampler::{sample_with_temperature, select_confident_positions, SamplingParams};
 
 /// Statistics from block generation
@@ -100,45 +100,23 @@ impl<'a> WeDLMDecoder<'a> {
         while !mask_positions.is_empty() {
             stats.steps += 1;
 
-            // Build current full sequence [prefix | block]
-            let block_tensor = Tensor::from_vec(
-                block_tokens.clone(),
+            // Compute reordering entirely on CPU - no GPU readback!
+            let reorder = compute_block_reorder(&block_tokens, &mask_positions, prefix_len);
+
+            // Upload reordered block and positions to GPU (single upload per step)
+            let reordered_block = Tensor::from_vec(
+                reorder.reordered_block,
                 (1, block_size),
                 device,
             )?.to_dtype(id_dtype)?;
-            let current_ids = Tensor::cat(&[prefix_ids, &block_tensor], 1)?;
-
-            // Convert block-relative mask_positions to absolute positions
-            let absolute_mask_positions: Vec<usize> = mask_positions
-                .iter()
-                .map(|&block_pos| prefix_len + block_pos)
-                .collect();
-
-            // Topological reorder: known tokens first, MASKs last
-            let reorder = topological_reorder(&current_ids, &absolute_mask_positions)?;
-
-            // Build TRUE position indices for the reordered block tokens
-            // Each reordered token maps back to its original absolute position
-            let block_positions: Vec<i64> = (0..block_size)
-                .map(|reorder_idx| {
-                    // The token at reordered position (prefix_len + reorder_idx)
-                    // came from original position permutation[prefix_len + reorder_idx]
-                    let original_pos = reorder.permutation[prefix_len + reorder_idx];
-                    original_pos as i64
-                })
-                .collect();
 
             let positions_tensor = Tensor::from_vec(
-                block_positions,
+                reorder.positions,
                 (1, block_size),
                 device,
             )?;
 
-            // Extract reordered block tokens
-            let reordered_block = reorder.reordered_ids.narrow(1, prefix_len, block_size)?;
-
-            // Compute how many tokens in block are filled vs MASK
-            let num_filled_in_block = block_size - mask_positions.len();
+            let num_filled_in_block = reorder.num_filled;
             let num_mask = mask_positions.len();
 
             // Forward pass with:
@@ -190,12 +168,12 @@ impl<'a> WeDLMDecoder<'a> {
             let mut positions_to_fill: Vec<(usize, u32)> = Vec::new();
             for &reorder_mask_idx in &selected_indices {
                 // Map from reordered MASK index to original block position
-                let reordered_full_pos = prefix_len + num_filled_in_block + reorder_mask_idx;
-                let original_full_pos = reorder.permutation[reordered_full_pos];
-                let block_pos = original_full_pos - prefix_len;
+                // MASKs are at the end: positions num_filled_in_block..block_size
+                let reordered_block_pos = num_filled_in_block + reorder_mask_idx;
+                let original_block_pos = reorder.block_permutation[reordered_block_pos];
                 let predicted_token = pred_vec[reorder_mask_idx];
 
-                positions_to_fill.push((block_pos, predicted_token));
+                positions_to_fill.push((original_block_pos, predicted_token));
                 stats.avg_confidence += conf_vec[reorder_mask_idx];
             }
 

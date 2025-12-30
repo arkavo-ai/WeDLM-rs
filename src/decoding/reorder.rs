@@ -5,10 +5,10 @@
 
 use candle_core::{Device, Error, Result, Tensor};
 
-/// Result of topological reordering
+/// Result of topological reordering (CPU-only, no tensors)
 pub struct ReorderResult {
-    /// Reordered token IDs [batch, seq_len]
-    pub reordered_ids: Tensor,
+    /// Reordered token IDs as CPU vector
+    pub reordered_ids: Vec<i64>,
     /// Mapping from reordered position to original position
     pub permutation: Vec<usize>,
     /// Inverse permutation (original -> reordered)
@@ -17,38 +17,86 @@ pub struct ReorderResult {
     pub num_known: usize,
 }
 
-/// Topological reordering: move non-MASK tokens to front, MASK tokens to end
+/// Result of block reordering for WeDLM decode step
+pub struct BlockReorderResult {
+    /// Reordered block tokens (CPU vec, ready to upload)
+    pub reordered_block: Vec<i64>,
+    /// Position indices for reordered block (TRUE absolute positions)
+    pub positions: Vec<i64>,
+    /// Mapping from reordered block position to original block position
+    pub block_permutation: Vec<usize>,
+    /// Number of filled (non-MASK) tokens in block
+    pub num_filled: usize,
+}
+
+/// Compute block reordering entirely on CPU - no GPU readback needed
 ///
 /// # Arguments
-/// * `input_ids` - Token IDs [batch, seq_len]
-/// * `mask_positions` - Explicit set of positions that are MASKs (absolute indices)
+/// * `block_tokens` - Current block tokens (CPU vec)
+/// * `mask_positions` - Which positions in block are still MASKs (block-relative indices)
+/// * `prefix_len` - Length of prefix (for computing absolute positions)
 ///
-/// Using explicit mask positions avoids the issue where a predicted token
-/// happens to equal the MASK token ID.
-pub fn topological_reorder(
-    input_ids: &Tensor,
+/// # Returns
+/// Reordered block tokens and position indices, ready to upload to GPU
+pub fn compute_block_reorder(
+    block_tokens: &[i64],
     mask_positions: &[usize],
-) -> Result<ReorderResult> {
-    let (batch_size, seq_len) = input_ids.dims2()?;
+    prefix_len: usize,
+) -> BlockReorderResult {
+    let block_size = block_tokens.len();
+    let mask_set: std::collections::HashSet<usize> = mask_positions.iter().copied().collect();
 
-    // For now, only support batch_size = 1
-    if batch_size != 1 {
-        return Err(Error::Msg("topological_reorder only supports batch_size=1".to_string()));
+    // Partition block positions: filled first, masks last
+    let mut filled_indices: Vec<usize> = Vec::new();
+    let mut mask_indices: Vec<usize> = Vec::new();
+
+    for i in 0..block_size {
+        if mask_set.contains(&i) {
+            mask_indices.push(i);
+        } else {
+            filled_indices.push(i);
+        }
     }
 
-    // Handle both I64 and U32 input dtypes
-    let ids: Vec<u32> = match input_ids.dtype() {
-        candle_core::DType::I64 => input_ids
-            .squeeze(0)?
-            .to_vec1::<i64>()?
-            .iter()
-            .map(|&x| x as u32)
-            .collect(),
-        _ => input_ids.squeeze(0)?.to_vec1()?,
-    };
-    let device = input_ids.device();
+    let num_filled = filled_indices.len();
 
-    // Convert mask_positions to a set for O(1) lookup
+    // Build block permutation: filled positions first, then mask positions
+    let mut block_permutation: Vec<usize> = Vec::with_capacity(block_size);
+    block_permutation.extend(&filled_indices);
+    block_permutation.extend(&mask_indices);
+
+    // Reorder block tokens according to permutation
+    let reordered_block: Vec<i64> = block_permutation
+        .iter()
+        .map(|&i| block_tokens[i])
+        .collect();
+
+    // Compute TRUE absolute positions for each reordered token
+    // Position = prefix_len + original_block_position
+    let positions: Vec<i64> = block_permutation
+        .iter()
+        .map(|&block_pos| (prefix_len + block_pos) as i64)
+        .collect();
+
+    BlockReorderResult {
+        reordered_block,
+        positions,
+        block_permutation,
+        num_filled,
+    }
+}
+
+/// Topological reordering: move non-MASK tokens to front, MASK tokens to end
+/// Works entirely on CPU data - no GPU readback
+///
+/// # Arguments
+/// * `ids` - Token IDs as CPU vector
+/// * `mask_positions` - Explicit set of positions that are MASKs (absolute indices)
+pub fn topological_reorder_cpu(
+    ids: &[i64],
+    mask_positions: &[usize],
+) -> ReorderResult {
+    let seq_len = ids.len();
     let mask_set: std::collections::HashSet<usize> = mask_positions.iter().copied().collect();
 
     // Partition into known (non-MASK) and unknown (MASK) positions
@@ -77,16 +125,40 @@ pub fn topological_reorder(
     }
 
     // Reorder the token IDs
-    let reordered: Vec<u32> = permutation.iter().map(|&i| ids[i]).collect();
-    let reordered_ids =
-        Tensor::from_vec(reordered, (1, seq_len), device)?.to_dtype(input_ids.dtype())?;
+    let reordered_ids: Vec<i64> = permutation.iter().map(|&i| ids[i]).collect();
 
-    Ok(ReorderResult {
+    ReorderResult {
         reordered_ids,
         permutation,
         inverse_perm,
         num_known,
-    })
+    }
+}
+
+/// Legacy function for compatibility - reads from GPU tensor
+/// Prefer compute_block_reorder() or topological_reorder_cpu() to avoid GPU readback
+pub fn topological_reorder(
+    input_ids: &Tensor,
+    mask_positions: &[usize],
+) -> Result<ReorderResult> {
+    let (batch_size, _seq_len) = input_ids.dims2()?;
+
+    if batch_size != 1 {
+        return Err(Error::Msg("topological_reorder only supports batch_size=1".to_string()));
+    }
+
+    // GPU READBACK - this is expensive on Metal, prefer CPU-only functions
+    let ids: Vec<i64> = match input_ids.dtype() {
+        candle_core::DType::I64 => input_ids.squeeze(0)?.to_vec1()?,
+        _ => input_ids
+            .squeeze(0)?
+            .to_vec1::<u32>()?
+            .iter()
+            .map(|&x| x as i64)
+            .collect(),
+    };
+
+    Ok(topological_reorder_cpu(&ids, mask_positions))
 }
 
 /// Reorder KV cache according to permutation
@@ -117,39 +189,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_topological_reorder() -> Result<()> {
-        let device = Device::Cpu;
+    fn test_topological_reorder_cpu() {
         // [known, MASK, known, MASK] -> [known, known, MASK, MASK]
-        let ids = Tensor::from_vec(vec![1u32, 151666, 2, 151666], (1, 4), &device)?;
+        let ids: Vec<i64> = vec![1, 151666, 2, 151666];
 
         // Explicitly specify mask positions (1 and 3)
         let mask_positions = vec![1, 3];
-        let result = topological_reorder(&ids, &mask_positions)?;
+        let result = topological_reorder_cpu(&ids, &mask_positions);
 
         assert_eq!(result.num_known, 2);
         assert_eq!(result.permutation, vec![0, 2, 1, 3]);
-
-        let reordered: Vec<u32> = result.reordered_ids.squeeze(0)?.to_vec1()?;
-        assert_eq!(reordered, vec![1, 2, 151666, 151666]);
-
-        Ok(())
+        assert_eq!(result.reordered_ids, vec![1, 2, 151666, 151666]);
     }
 
     #[test]
-    fn test_reorder_ignores_token_value() -> Result<()> {
-        let device = Device::Cpu;
+    fn test_reorder_ignores_token_value() {
         // Token at position 1 happens to be 151666 (MASK ID) but is NOT a mask
         // Only position 3 is actually a mask
-        let ids = Tensor::from_vec(vec![1u32, 151666, 2, 151666], (1, 4), &device)?;
+        let ids: Vec<i64> = vec![1, 151666, 2, 151666];
 
         // Only position 3 is a mask
         let mask_positions = vec![3];
-        let result = topological_reorder(&ids, &mask_positions)?;
+        let result = topological_reorder_cpu(&ids, &mask_positions);
 
         // Position 1 should be treated as known (even though it has MASK token ID)
         assert_eq!(result.num_known, 3);
         assert_eq!(result.permutation, vec![0, 1, 2, 3]); // Only pos 3 moves to end
+    }
 
-        Ok(())
+    #[test]
+    fn test_compute_block_reorder() {
+        // Block with positions 0,1 filled, 2,3 are masks
+        let block_tokens: Vec<i64> = vec![100, 200, 151666, 151666];
+        let mask_positions = vec![2, 3]; // block-relative
+        let prefix_len = 10;
+
+        let result = compute_block_reorder(&block_tokens, &mask_positions, prefix_len);
+
+        assert_eq!(result.num_filled, 2);
+        assert_eq!(result.reordered_block, vec![100, 200, 151666, 151666]);
+        // Positions are absolute: prefix_len + block_pos
+        assert_eq!(result.positions, vec![10, 11, 12, 13]);
+        assert_eq!(result.block_permutation, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_compute_block_reorder_mixed() {
+        // Block: [MASK, filled, MASK, filled] -> [filled, filled, MASK, MASK]
+        let block_tokens: Vec<i64> = vec![151666, 100, 151666, 200];
+        let mask_positions = vec![0, 2]; // block-relative
+        let prefix_len = 5;
+
+        let result = compute_block_reorder(&block_tokens, &mask_positions, prefix_len);
+
+        assert_eq!(result.num_filled, 2);
+        assert_eq!(result.reordered_block, vec![100, 200, 151666, 151666]);
+        // Original positions were 1,3,0,2 -> absolute: 6,8,5,7
+        assert_eq!(result.positions, vec![6, 8, 5, 7]);
+        assert_eq!(result.block_permutation, vec![1, 3, 0, 2]);
     }
 }

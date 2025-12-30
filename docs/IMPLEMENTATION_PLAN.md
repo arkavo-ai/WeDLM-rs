@@ -94,11 +94,17 @@ High-performance Rust inference engine for WeDLM-8B using Candle, targeting Appl
 - [x] **Performance tuning** ✅
   - Sweep tested 80 parameter combinations
   - Optimal config: `block_size=32, confidence=0.5, max_per_step=32`
-  - Results: **~20x speedup** over autoregressive (45 tok/s vs 2.3 tok/s)
+  - Results: **~11x speedup** over autoregressive (45 tok/s vs 3.9 tok/s)
   - Key insights:
     - Larger blocks = more parallelism (32 >> 8)
     - Lower confidence = more aggressive acceptance
     - max_per_step should match block_size
+
+- [x] **GPU readback elimination** ✅
+  - Refactored `topological_reorder` to work on CPU data only
+  - `compute_block_reorder()` builds tensors directly from CPU vecs
+  - Single GPU upload per iteration (no readback in decode loop)
+  - ~1.6% throughput improvement, cleaner code
 
 - [ ] **Batch processing**
   - Support batch_size > 1
