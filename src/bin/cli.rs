@@ -5,12 +5,55 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use hf_hub::{api::sync::Api, Repo, RepoType};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use wedlm_rs::decoding::SamplingParams;
 use wedlm_rs::WeDLMEngine;
+
+/// Resolve a model path - either local directory or HuggingFace model ID
+/// 
+/// If the path exists locally, use it directly.
+/// Otherwise, treat it as a HF model ID (e.g., "tencent/WeDLM-8B-Instruct")
+/// and resolve from the HuggingFace cache.
+fn resolve_model_path(model: &str) -> Result<PathBuf> {
+    let local_path = PathBuf::from(model);
+    
+    // Check if it's a local path that exists
+    if local_path.exists() {
+        return Ok(local_path);
+    }
+    
+    // Treat as HuggingFace model ID
+    if !model.contains('/') {
+        anyhow::bail!(
+            "Model '{}' not found locally and doesn't look like a HF model ID (expected 'org/model')",
+            model
+        );
+    }
+    
+    eprintln!("Resolving HuggingFace model: {}", model);
+    
+    let api = Api::new().context("Failed to initialize HuggingFace API")?;
+    let repo = api.repo(Repo::new(model.to_string(), RepoType::Model));
+    
+    // Get the cache directory for this model by fetching config.json
+    // This ensures the model is cached and gives us the snapshot path
+    let config_path = repo
+        .get("config.json")
+        .context("Failed to fetch config.json - model may not exist or not be cached")?;
+    
+    // The model directory is the parent of config.json
+    let model_dir = config_path
+        .parent()
+        .context("Invalid cache path structure")?
+        .to_path_buf();
+    
+    eprintln!("Resolved to: {}", model_dir.display());
+    Ok(model_dir)
+}
 
 #[derive(Parser)]
 #[command(name = "wedlm-cli")]
@@ -24,9 +67,9 @@ struct Cli {
 enum Commands {
     /// Generate text from a prompt
     Generate {
-        /// Path to model directory
+        /// Model path or HuggingFace ID (e.g., tencent/WeDLM-8B-Instruct)
         #[arg(short, long)]
-        model: PathBuf,
+        model: String,
 
         /// Input prompt
         #[arg(short, long)]
@@ -40,16 +83,24 @@ enum Commands {
         #[arg(short, long, default_value = "0.2")]
         temperature: f32,
 
-        /// Confidence threshold for WeDLM decoding (lower = more aggressive)
-        #[arg(short, long, default_value = "0.5")]
-        confidence: f32,
+        /// Entropy threshold for WeDLM decoding (lower = better quality, higher = faster)
+        #[arg(short = 'e', long, default_value = "0.6")]
+        entropy_threshold: f32,
 
-        /// Block size for WeDLM parallel decoding
-        #[arg(short, long, default_value = "96")]
+        /// Margin threshold (unused with streaming, kept for compatibility)
+        #[arg(long, default_value = "0.0")]
+        margin_threshold: f32,
+
+        /// Distance penalty coefficient λ for H̃ = H + λ·d selection
+        #[arg(long, default_value = "0.02")]
+        distance_penalty: f32,
+
+        /// Window size for WeDLM streaming parallel decoding
+        #[arg(short, long, default_value = "32")]
         block_size: usize,
 
         /// Max tokens to accept per iteration within a block
-        #[arg(long, default_value = "96")]
+        #[arg(long, default_value = "4")]
         max_per_step: usize,
 
         /// Use simple autoregressive decoding instead of WeDLM
@@ -59,16 +110,16 @@ enum Commands {
 
     /// Test model loading
     Test {
-        /// Path to model directory
+        /// Model path or HuggingFace ID (e.g., tencent/WeDLM-8B-Instruct)
         #[arg(short, long)]
-        model: PathBuf,
+        model: String,
     },
 
     /// Benchmark autoregressive vs WeDLM parallel decoding
     Benchmark {
-        /// Path to model directory
+        /// Model path or HuggingFace ID (e.g., tencent/WeDLM-8B-Instruct)
         #[arg(short, long)]
-        model: PathBuf,
+        model: String,
 
         /// Number of tokens to generate per run
         #[arg(short = 'n', long, default_value = "64")]
@@ -86,24 +137,32 @@ enum Commands {
         #[arg(short, long, default_value = "0.3")]
         temperature: f32,
 
-        /// Block size for WeDLM parallel decoding
+        /// Window size for WeDLM streaming parallel decoding
         #[arg(short, long, default_value = "96")]
         block_size: usize,
 
-        /// Confidence threshold for accepting predictions (lower = more aggressive)
-        #[arg(short, long, default_value = "0.5")]
-        confidence: f32,
+        /// Entropy threshold for WeDLM decoding (lower = better quality, higher = faster)
+        #[arg(short = 'e', long, default_value = "0.6")]
+        entropy_threshold: f32,
+
+        /// Margin threshold: require logit(top1) - logit(top2) >= this value
+        #[arg(long, default_value = "0.0")]
+        margin_threshold: f32,
+
+        /// Distance penalty coefficient λ for H̃ = H + λ·d selection
+        #[arg(long, default_value = "0.02")]
+        distance_penalty: f32,
 
         /// Max tokens to accept per iteration within a block
-        #[arg(long, default_value = "96")]
+        #[arg(long, default_value = "4")]
         max_per_step: usize,
     },
 
     /// Sweep parameters to find optimal WeDLM configuration
     Sweep {
-        /// Path to model directory
+        /// Model path or HuggingFace ID (e.g., tencent/WeDLM-8B-Instruct)
         #[arg(short, long)]
-        model: PathBuf,
+        model: String,
 
         /// Number of tokens to generate per run
         #[arg(short = 'n', long, default_value = "64")]
@@ -132,35 +191,64 @@ fn main() -> Result<()> {
             prompt,
             max_tokens,
             temperature,
-            confidence,
+            entropy_threshold,
+            margin_threshold,
+            distance_penalty,
             block_size,
             max_per_step,
             autoregressive,
         } => {
-            tracing::info!("Loading model from {:?}...", model);
-            let engine = WeDLMEngine::from_pretrained(&model)?;
+            // Resolve model path (local or HuggingFace)
+            let model_path = resolve_model_path(&model)?;
 
-            tracing::info!("Generating...");
+            // Model loading with timing
+            eprintln!("Model loading...");
+            let load_start = Instant::now();
+            let engine = WeDLMEngine::from_pretrained(&model_path)?;
+            let load_time = load_start.elapsed();
+            eprintln!("Model loaded in {:.2}s", load_time.as_secs_f64());
+
+            // Generation with timing
+            eprintln!("\nGenerating...");
+            let gen_start = Instant::now();
             let output = if autoregressive {
                 engine.generate_autoregressive(&prompt, max_tokens, temperature)?
             } else {
                 let params = SamplingParams {
                     temperature,
-                    confidence_threshold: confidence,
+                    entropy_threshold,
+                    margin_threshold,
+                    distance_penalty,
                     max_tokens_per_step: max_per_step,
                     ..Default::default()
                 };
                 engine.generate_with_block_size(&prompt, max_tokens, block_size, Some(params))?
             };
+            let gen_time = gen_start.elapsed();
 
-            println!("\n{}", output);
+            // Count output tokens (approximate by splitting on whitespace + punctuation)
+            let prompt_len = prompt.len();
+            let output_only = &output[prompt_len..].trim();
+            let token_count = output_only.split_whitespace().count().max(1);
+            let tokens_per_sec = token_count as f64 / gen_time.as_secs_f64();
+
+            // Output
+            eprintln!("\n--- Output ---");
+            println!("{}", output);
+            
+            // Stats
+            eprintln!("\n--- Stats ---");
+            eprintln!("TTS (time to generate): {:.2}s", gen_time.as_secs_f64());
+            eprintln!("Tokens generated: ~{}", token_count);
+            eprintln!("Speed: {:.1} tok/s", tokens_per_sec);
         }
 
         Commands::Test { model } => {
-            tracing::info!("Testing model loading from {:?}...", model);
+            let model_path = resolve_model_path(&model)?;
+            tracing::info!("Testing model loading from {:?}...", model_path);
 
             // Load config
-            let config_path = model.join("config.json");
+            let config_path = model_path.join("config.json");
             let config = wedlm_rs::WeDLMConfig::from_file(&config_path)?;
             tracing::info!("Config loaded: {} layers, {} hidden", config.num_hidden_layers, config.hidden_size);
 
@@ -184,7 +272,7 @@ fn main() -> Result<()> {
             };
 
             tracing::info!("Loading weights...");
-            let vb = wedlm_rs::weights::load_model_vb(&model, dtype, &device)?;
+            let vb = wedlm_rs::weights::load_model_vb(&model_path, dtype, &device)?;
             tracing::info!("Weights loaded successfully");
 
             // Build model
@@ -212,16 +300,21 @@ fn main() -> Result<()> {
             runs,
             temperature,
             block_size,
-            confidence,
+            entropy_threshold,
+            margin_threshold,
+            distance_penalty,
             max_per_step,
         } => {
-            tracing::info!("Loading model from {:?}...", model);
-            let engine = WeDLMEngine::from_pretrained(&model)?;
+            let model_path = resolve_model_path(&model)?;
+            tracing::info!("Loading model from {:?}...", model_path);
+            let engine = WeDLMEngine::from_pretrained(&model_path)?;
 
             let prompt = "The quick brown fox jumps over the lazy dog. In a world where technology";
             let params = SamplingParams {
                 temperature,
-                confidence_threshold: confidence,
+                entropy_threshold,
+                margin_threshold,
+                distance_penalty,
                 max_tokens_per_step: max_per_step,
                 ..Default::default()
             };
@@ -229,7 +322,7 @@ fn main() -> Result<()> {
             println!("\n=== WeDLM Benchmark ===");
             println!("Prompt: \"{}...\"", &prompt[..50.min(prompt.len())]);
             println!("Tokens per run: {}", tokens);
-            println!("Block size: {}, Confidence: {}, Max/step: {}", block_size, confidence, max_per_step);
+            println!("Block size: {}, Entropy thresh: {}, Margin: {}, Max/step: {}", block_size, entropy_threshold, margin_threshold, max_per_step);
             println!("Warmup runs: {}, Benchmark runs: {}", warmup, runs);
             println!();
 
@@ -308,19 +401,20 @@ fn main() -> Result<()> {
             tokens,
             temperature,
         } => {
-            tracing::info!("Loading model from {:?}...", model);
-            let engine = WeDLMEngine::from_pretrained(&model)?;
+            let model_path = resolve_model_path(&model)?;
+            tracing::info!("Loading model from {:?}...", model_path);
+            let engine = WeDLMEngine::from_pretrained(&model_path)?;
 
             let prompt = "The quick brown fox jumps over the lazy dog. In a world where technology";
 
             // Parameter ranges to sweep
-            let block_sizes = [4, 8, 16, 32];
-            let confidences = [0.5, 0.6, 0.7, 0.8, 0.9];
-            let max_per_steps = [4, 8, 16, 32];
+            let block_sizes = [8, 16, 32, 64];
+            let entropy_thresholds = [1.0, 2.0, 3.0, 4.0, 6.0];
+            let max_per_steps = [8, 16, 32, 64];
 
             println!("\n=== WeDLM Parameter Sweep ===");
             println!("Tokens: {}, Temperature: {}", tokens, temperature);
-            println!("Testing {} configurations...\n", block_sizes.len() * confidences.len() * max_per_steps.len());
+            println!("Testing {} configurations...\n", block_sizes.len() * entropy_thresholds.len() * max_per_steps.len());
 
             // First get autoregressive baseline
             println!("Getting autoregressive baseline...");
@@ -330,14 +424,14 @@ fn main() -> Result<()> {
             let ar_tok_per_sec = tokens as f64 / ar_time;
             println!("Autoregressive: {:.2}s ({:.1} tok/s)\n", ar_time, ar_tok_per_sec);
 
-            println!("{:>6} {:>6} {:>8} {:>8} {:>8}", "block", "conf", "max/step", "tok/s", "speedup");
-            println!("{}", "-".repeat(44));
+            println!("{:>6} {:>8} {:>8} {:>8} {:>8}", "block", "entropy", "max/step", "tok/s", "speedup");
+            println!("{}", "-".repeat(48));
 
             let mut best_speedup = 0.0f64;
             let mut best_config = (0usize, 0.0f32, 0usize);
 
             for &block_size in &block_sizes {
-                for &confidence in &confidences {
+                for &entropy_threshold in &entropy_thresholds {
                     for &max_per_step in &max_per_steps {
                         // Skip configs where max_per_step > block_size (pointless)
                         if max_per_step > block_size {
@@ -346,7 +440,7 @@ fn main() -> Result<()> {
 
                         let params = SamplingParams {
                             temperature,
-                            confidence_threshold: confidence,
+                            entropy_threshold,
                             max_tokens_per_step: max_per_step,
                             ..Default::default()
                         };
@@ -360,13 +454,13 @@ fn main() -> Result<()> {
                         let speedup = ar_time / elapsed;
 
                         println!(
-                            "{:>6} {:>6.1} {:>8} {:>8.1} {:>7.2}x",
-                            block_size, confidence, max_per_step, tok_per_sec, speedup
+                            "{:>6} {:>8.2} {:>8} {:>8.1} {:>7.2}x",
+                            block_size, entropy_threshold, max_per_step, tok_per_sec, speedup
                         );
 
                         if speedup > best_speedup {
                             best_speedup = speedup;
-                            best_config = (block_size, confidence, max_per_step);
+                            best_config = (block_size, entropy_threshold, max_per_step);
                         }
                     }
                 }
@@ -374,7 +468,7 @@ fn main() -> Result<()> {
 
             println!("\n=== Best Configuration ===");
             println!(
-                "block_size={}, confidence={:.1}, max_per_step={} -> {:.2}x speedup",
+                "block_size={}, entropy_threshold={:.2}, max_per_step={} -> {:.2}x speedup",
                 best_config.0, best_config.1, best_config.2, best_speedup
             );
         }
