@@ -106,6 +106,12 @@ High-performance Rust inference engine for WeDLM-8B using Candle, targeting Appl
   - Single GPU upload per iteration (no readback in decode loop)
   - ~1.6% throughput improvement, cleaner code
 
+- [x] **Incremental cache update** ✅
+  - `commit_block_to_cache()` now runs only the block with existing prefix cache
+  - Model concatenates K/V internally, returns combined cache
+  - O(block_len) instead of O(prefix_len + block_len) per block
+  - **+30% throughput improvement** (45 → 58.7 tok/s, 15.16x speedup)
+
 - [ ] **Batch processing**
   - Support batch_size > 1
   - Efficient batched attention

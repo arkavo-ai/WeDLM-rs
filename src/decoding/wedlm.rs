@@ -73,12 +73,15 @@ impl<'a> WeDLMDecoder<'a> {
     /// Uses topological reordering with correct RoPE positions:
     /// - Tokens are reordered (filled first, MASKs last) for efficient attention
     /// - RoPE uses TRUE absolute positions, preserving semantic correctness
+    ///
+    /// # Returns
+    /// (output_ids, block_tokens, stats) - block_tokens is the completed block on CPU
     pub fn generate_block(
         &mut self,
         prefix_ids: &Tensor,
         block_size: usize,
         params: &SamplingParams,
-    ) -> Result<(Tensor, BlockStats)> {
+    ) -> Result<(Tensor, Vec<i64>, BlockStats)> {
         let device = prefix_ids.device();
         let id_dtype = prefix_ids.dtype();  // I64 for token IDs
         let prefix_len = prefix_ids.dim(1)?;
@@ -203,18 +206,54 @@ impl<'a> WeDLMDecoder<'a> {
         }
 
         // Build final output
-        let final_block = Tensor::from_vec(block_tokens, (1, block_size), device)?.to_dtype(id_dtype)?;
+        let final_block = Tensor::from_vec(block_tokens.clone(), (1, block_size), device)?.to_dtype(id_dtype)?;
         let output_ids = Tensor::cat(&[prefix_ids, &final_block], 1)?;
 
-        Ok((output_ids, stats))
+        Ok((output_ids, block_tokens, stats))
     }
 
-    /// Commit completed block to prefix cache
-    pub fn commit_block_to_cache(&mut self, full_sequence: &Tensor) -> Result<()> {
-        let new_len = full_sequence.dim(1)?;
-        let (_, new_caches) = self.model.forward(full_sequence, 0, None)?;
+    /// Commit completed block to prefix cache incrementally
+    ///
+    /// Instead of recomputing the full sequence, we run just the block tokens
+    /// with the existing prefix cache. The model concatenates K/V internally,
+    /// so we get the combined (prefix + block) cache back.
+    ///
+    /// This is O(block_len) instead of O(prefix_len + block_len).
+    pub fn commit_block_to_cache(&mut self, block_tokens: &[i64], device: &candle_core::Device) -> Result<()> {
+        let block_size = block_tokens.len();
+
+        // Build block tensor with sequential positions
+        let block_tensor = Tensor::from_vec(
+            block_tokens.to_vec(),
+            (1, block_size),
+            device,
+        )?.to_dtype(candle_core::DType::I64)?;
+
+        // Sequential positions starting after prefix
+        let positions: Vec<i64> = (0..block_size)
+            .map(|i| (self.prefix_cache_len + i) as i64)
+            .collect();
+        let positions_tensor = Tensor::from_vec(positions, (1, block_size), device)?;
+
+        // Convert prefix cache to the format expected by forward_with_positions
+        let prefix_caches: Vec<Option<(Tensor, Tensor)>> = self
+            .prefix_cache
+            .as_ref()
+            .map(|caches| {
+                caches.iter().map(|(k, v)| Some((k.clone(), v.clone()))).collect()
+            })
+            .unwrap_or_else(|| vec![None; self.model.num_layers()]);
+
+        // Run just the block with prefix cache - model concatenates K/V internally
+        let (_, new_caches) = self.model.forward_with_positions(
+            &block_tensor,
+            &positions_tensor,
+            Some(&prefix_caches),
+            None,
+        )?;
+
         self.prefix_cache = Some(new_caches);
-        self.prefix_cache_len = new_len;
+        self.prefix_cache_len += block_size;
         Ok(())
     }
 
@@ -232,6 +271,7 @@ impl<'a> WeDLMDecoder<'a> {
         block_size: usize,
         params: &SamplingParams,
     ) -> Result<Tensor> {
+        let device = prompt_ids.device();
         let mut all_ids = prompt_ids.clone();
         let mut total_generated = 0;
 
@@ -241,22 +281,18 @@ impl<'a> WeDLMDecoder<'a> {
             let remaining = max_new_tokens - total_generated;
             let current_block_size = remaining.min(block_size);
 
-            let (new_ids, _stats) = self.generate_block(&all_ids, current_block_size, params)?;
+            let (new_ids, block_tokens, _stats) = self.generate_block(&all_ids, current_block_size, params)?;
 
-            let new_part_start = all_ids.dim(1)?;
-            all_ids = new_ids.clone();
+            all_ids = new_ids;
             total_generated += current_block_size;
 
-            let ids_vec: Vec<i64> = all_ids.squeeze(0)?.to_vec1()?;
-            if ids_vec[new_part_start..]
-                .iter()
-                .any(|&t| t as u32 == self.eos_token_id)
-            {
+            // Check for EOS in block (using CPU data, no GPU readback)
+            if block_tokens.iter().any(|&t| t as u32 == self.eos_token_id) {
                 break;
             }
 
-            // Commit block to cache
-            self.commit_block_to_cache(&all_ids)?;
+            // Commit block to cache incrementally - O(block_len) not O(prefix_len)
+            self.commit_block_to_cache(&block_tokens, device)?;
         }
 
         Ok(all_ids)
