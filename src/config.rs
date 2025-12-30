@@ -97,9 +97,13 @@ impl WeDLMConfig {
     /// Get the candle DType based on config
     /// Note: We default to F16 for Metal compatibility (full index_select support)
     pub fn candle_dtype(&self) -> DType {
-        // Always use F16 for Metal - BF16 lacks index_select support
-        // F16 has full Metal support and same memory footprint
-        DType::F16
+        match self.dtype.to_lowercase().as_str() {
+            "float32" | "f32" => DType::F32,
+            "float16" | "f16" | "half" => DType::F16,
+            "bfloat16" | "bf16" => DType::BF16,
+            // Default to F16 for Metal compatibility (BF16 lacks full support)
+            _ => DType::F16,
+        }
     }
 
     /// Create a default config matching WeDLM-8B-Instruct

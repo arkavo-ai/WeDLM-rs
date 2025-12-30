@@ -105,7 +105,7 @@ pub fn calculate_entropy(probs: &Tensor) -> Result<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{DType, Device};
+    use candle_core::Device;
 
     #[test]
     fn test_select_confident() -> Result<()> {

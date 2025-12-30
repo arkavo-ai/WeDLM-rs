@@ -3,6 +3,7 @@
 //! Command-line interface for WeDLM inference.
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -53,6 +54,29 @@ enum Commands {
         /// Path to model directory
         #[arg(short, long)]
         model: PathBuf,
+    },
+
+    /// Benchmark autoregressive vs WeDLM parallel decoding
+    Benchmark {
+        /// Path to model directory
+        #[arg(short, long)]
+        model: PathBuf,
+
+        /// Number of tokens to generate per run
+        #[arg(short = 'n', long, default_value = "64")]
+        tokens: usize,
+
+        /// Number of warmup runs
+        #[arg(long, default_value = "1")]
+        warmup: usize,
+
+        /// Number of benchmark runs
+        #[arg(long, default_value = "3")]
+        runs: usize,
+
+        /// Temperature for sampling
+        #[arg(short, long, default_value = "0.3")]
+        temperature: f32,
     },
 }
 
@@ -141,6 +165,99 @@ fn main() -> Result<()> {
             tracing::info!("Vocab size from logits: {}", vocab_size);
 
             println!("All tests passed!");
+        }
+
+        Commands::Benchmark {
+            model,
+            tokens,
+            warmup,
+            runs,
+            temperature,
+        } => {
+            tracing::info!("Loading model from {:?}...", model);
+            let engine = WeDLMEngine::from_pretrained(&model)?;
+
+            let prompt = "The quick brown fox jumps over the lazy dog. In a world where technology";
+            let params = SamplingParams {
+                temperature,
+                confidence_threshold: 0.8,
+                ..Default::default()
+            };
+
+            println!("\n=== WeDLM Benchmark ===");
+            println!("Prompt: \"{}...\"", &prompt[..50.min(prompt.len())]);
+            println!("Tokens per run: {}", tokens);
+            println!("Warmup runs: {}, Benchmark runs: {}", warmup, runs);
+            println!();
+
+            // Warmup for autoregressive
+            println!("Warming up autoregressive...");
+            for _ in 0..warmup {
+                let _ = engine.generate_autoregressive(prompt, tokens, temperature)?;
+            }
+
+            // Benchmark autoregressive
+            println!("Benchmarking autoregressive...");
+            let mut ar_times = Vec::with_capacity(runs);
+            for i in 0..runs {
+                let start = Instant::now();
+                let _output = engine.generate_autoregressive(prompt, tokens, temperature)?;
+                let elapsed = start.elapsed();
+                ar_times.push(elapsed);
+                println!(
+                    "  Run {}: {:.2}s ({:.1} tok/s)",
+                    i + 1,
+                    elapsed.as_secs_f64(),
+                    tokens as f64 / elapsed.as_secs_f64()
+                );
+            }
+
+            // Warmup for WeDLM
+            println!("\nWarming up WeDLM parallel...");
+            for _ in 0..warmup {
+                let _ = engine.generate(prompt, tokens, Some(params.clone()))?;
+            }
+
+            // Benchmark WeDLM
+            println!("Benchmarking WeDLM parallel...");
+            let mut wedlm_times = Vec::with_capacity(runs);
+            for i in 0..runs {
+                let start = Instant::now();
+                let _output = engine.generate(prompt, tokens, Some(params.clone()))?;
+                let elapsed = start.elapsed();
+                wedlm_times.push(elapsed);
+
+                println!(
+                    "  Run {}: {:.2}s ({:.1} tok/s)",
+                    i + 1,
+                    elapsed.as_secs_f64(),
+                    tokens as f64 / elapsed.as_secs_f64()
+                );
+            }
+
+            // Calculate averages
+            let ar_avg: f64 = ar_times.iter().map(|t| t.as_secs_f64()).sum::<f64>() / runs as f64;
+            let wedlm_avg: f64 = wedlm_times.iter().map(|t| t.as_secs_f64()).sum::<f64>() / runs as f64;
+
+            let ar_tok_per_sec = tokens as f64 / ar_avg;
+            let wedlm_tok_per_sec = tokens as f64 / wedlm_avg;
+            let speedup = ar_avg / wedlm_avg;
+
+            println!("\n=== Results ===");
+            println!(
+                "Autoregressive:  {:.2}s avg ({:.1} tok/s)",
+                ar_avg, ar_tok_per_sec
+            );
+            println!(
+                "WeDLM Parallel:  {:.2}s avg ({:.1} tok/s)",
+                wedlm_avg, wedlm_tok_per_sec
+            );
+            println!();
+            if speedup > 1.0 {
+                println!("WeDLM is {:.2}x FASTER than autoregressive", speedup);
+            } else {
+                println!("WeDLM is {:.2}x SLOWER than autoregressive", 1.0 / speedup);
+            }
         }
     }
 

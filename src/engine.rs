@@ -142,12 +142,10 @@ impl WeDLMEngine {
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
         let mut ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
 
-        let dtype = self.config.candle_dtype();
-
         // Generate token by token
         for _ in 0..max_new_tokens {
-            let input = candle_core::Tensor::from_vec(ids.clone(), (1, ids.len()), &self.device)?
-                .to_dtype(dtype)?;
+            // Token IDs stay as I64 - embedding layer handles conversion
+            let input = candle_core::Tensor::from_vec(ids.clone(), (1, ids.len()), &self.device)?;
 
             let (logits, _) = self.model.forward(&input, 0, None)?;
 

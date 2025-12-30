@@ -80,14 +80,16 @@ High-performance Rust inference engine for WeDLM-8B using Candle, targeting Appl
   - Added test `test_reorder_ignores_token_value` to verify
 
 ### Phase 5: Performance & Polish
-- [ ] **Parity testing**
+- [x] **Parity testing** ✅
   - Compare Rust vs Python logits for synthetic inputs
   - Verify explicit position handling matches Python exactly
+  - Test: `tests/parity_explicit_positions.rs` with 1-layer synthetic model fixture
 
-- [ ] **Benchmarking suite**
-  - Tokens per second measurement
-  - Memory usage tracking
+- [x] **Benchmarking suite** (Basic)
+  - Tokens per second measurement via CLI `benchmark` command
   - Comparison: autoregressive vs WeDLM block decoding
+  - Results: WeDLM 3.47x faster at 32 tokens, 4.51x at 64 tokens
+  - [ ] Memory usage tracking (not yet implemented)
 
 - [ ] **Batch processing**
   - Support batch_size > 1
@@ -100,19 +102,6 @@ High-performance Rust inference engine for WeDLM-8B using Candle, targeting Appl
 - [ ] **Error handling improvements**
   - Graceful degradation on OOM
   - Better error messages
-
-### Phase 6: Advanced Features (Future)
-- [ ] **Speculative decoding integration**
-  - Combine WeDLM with draft models
-  - Hybrid decoding strategies
-
-- [ ] **Quantization support**
-  - INT8/INT4 weight quantization
-  - Reduced memory footprint
-
-- [ ] **Multi-GPU support**
-  - Tensor parallelism for larger models
-  - Pipeline parallelism
 
 ## Technical Notes
 

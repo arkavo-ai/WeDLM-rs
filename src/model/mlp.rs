@@ -51,7 +51,7 @@ mod tests {
 
     #[test]
     fn test_silu() -> Result<()> {
-        use candle_core::{DType, Device};
+        use candle_core::Device;
 
         // SiLU(x) = x * sigmoid(x)
         let x = Tensor::from_vec(vec![0.0f32, 1.0, -1.0], (3,), &Device::Cpu)?;
