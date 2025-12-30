@@ -112,6 +112,13 @@ High-performance Rust inference engine for WeDLM-8B using Candle, targeting Appl
   - O(block_len) instead of O(prefix_len + block_len) per block
   - **+30% throughput improvement** (45 → 58.7 tok/s, 15.16x speedup)
 
+- [x] **Per-step allocation elimination** ✅
+  - Pre-allocate `BlockReorderResult` and `positions_to_fill` before loop
+  - `compute_block_reorder_into()` reuses buffers instead of allocating
+  - Pass `&self.prefix_cache` directly (changed storage to `Vec<Option<...>>`)
+  - Use `Tensor::from_slice` instead of `from_vec` to avoid clones
+  - **+3.4% throughput improvement** (58.7 → 60.7 tok/s, 15.15x speedup)
+
 - [ ] **Batch processing**
   - Support batch_size > 1
   - Efficient batched attention

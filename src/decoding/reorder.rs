@@ -43,46 +43,51 @@ pub fn compute_block_reorder(
     mask_positions: &[usize],
     prefix_len: usize,
 ) -> BlockReorderResult {
+    let mut result = BlockReorderResult {
+        reordered_block: Vec::with_capacity(block_tokens.len()),
+        positions: Vec::with_capacity(block_tokens.len()),
+        block_permutation: Vec::with_capacity(block_tokens.len()),
+        num_filled: 0,
+    };
+    compute_block_reorder_into(block_tokens, mask_positions, prefix_len, &mut result);
+    result
+}
+
+/// Compute block reordering into pre-allocated buffers (zero allocation in hot loop)
+pub fn compute_block_reorder_into(
+    block_tokens: &[i64],
+    mask_positions: &[usize],
+    prefix_len: usize,
+    result: &mut BlockReorderResult,
+) {
     let block_size = block_tokens.len();
     let mask_set: std::collections::HashSet<usize> = mask_positions.iter().copied().collect();
 
-    // Partition block positions: filled first, masks last
-    let mut filled_indices: Vec<usize> = Vec::new();
-    let mut mask_indices: Vec<usize> = Vec::new();
+    // Clear and reuse buffers
+    result.reordered_block.clear();
+    result.positions.clear();
+    result.block_permutation.clear();
 
+    // Partition: filled positions first, then mask positions
+    // First pass: add filled indices
+    for i in 0..block_size {
+        if !mask_set.contains(&i) {
+            result.block_permutation.push(i);
+        }
+    }
+    result.num_filled = result.block_permutation.len();
+
+    // Second pass: add mask indices
     for i in 0..block_size {
         if mask_set.contains(&i) {
-            mask_indices.push(i);
-        } else {
-            filled_indices.push(i);
+            result.block_permutation.push(i);
         }
     }
 
-    let num_filled = filled_indices.len();
-
-    // Build block permutation: filled positions first, then mask positions
-    let mut block_permutation: Vec<usize> = Vec::with_capacity(block_size);
-    block_permutation.extend(&filled_indices);
-    block_permutation.extend(&mask_indices);
-
-    // Reorder block tokens according to permutation
-    let reordered_block: Vec<i64> = block_permutation
-        .iter()
-        .map(|&i| block_tokens[i])
-        .collect();
-
-    // Compute TRUE absolute positions for each reordered token
-    // Position = prefix_len + original_block_position
-    let positions: Vec<i64> = block_permutation
-        .iter()
-        .map(|&block_pos| (prefix_len + block_pos) as i64)
-        .collect();
-
-    BlockReorderResult {
-        reordered_block,
-        positions,
-        block_permutation,
-        num_filled,
+    // Build reordered tokens and positions from permutation
+    for &block_pos in &result.block_permutation {
+        result.reordered_block.push(block_tokens[block_pos]);
+        result.positions.push((prefix_len + block_pos) as i64);
     }
 }
 

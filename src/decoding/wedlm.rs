@@ -19,7 +19,7 @@ use candle_core::{DType, Result, Tensor};
 use crate::model::WeDLMForCausalLM;
 use crate::MASK_TOKEN_ID;
 
-use super::reorder::compute_block_reorder;
+use super::reorder::{compute_block_reorder_into, BlockReorderResult};
 use super::sampler::{sample_with_temperature, select_confident_positions, SamplingParams};
 
 /// Statistics from block generation
@@ -38,7 +38,8 @@ pub struct WeDLMDecoder<'a> {
     mask_token_id: u32,
     eos_token_id: u32,
     /// Cached K/V for stable prefix (one per layer)
-    prefix_cache: Option<Vec<(Tensor, Tensor)>>,
+    /// Stored as Vec<Option<...>> to match forward_with_positions API and avoid per-step allocation
+    prefix_cache: Vec<Option<(Tensor, Tensor)>>,
     /// Length of cached prefix
     prefix_cache_len: usize,
 }
@@ -50,7 +51,7 @@ impl<'a> WeDLMDecoder<'a> {
             model,
             mask_token_id: mask_token_id.unwrap_or(MASK_TOKEN_ID),
             eos_token_id: config.eos_token_id,
-            prefix_cache: None,
+            prefix_cache: Vec::new(),
             prefix_cache_len: 0,
         }
     }
@@ -62,7 +63,8 @@ impl<'a> WeDLMDecoder<'a> {
         // Forward pass for prefix only
         let (_, new_caches) = self.model.forward(prefix_ids, 0, None)?;
 
-        self.prefix_cache = Some(new_caches);
+        // Store as Vec<Option<...>> to match forward_with_positions API
+        self.prefix_cache = new_caches.into_iter().map(Some).collect();
         self.prefix_cache_len = prefix_len;
 
         Ok(())
@@ -88,7 +90,7 @@ impl<'a> WeDLMDecoder<'a> {
         let mut stats = BlockStats::default();
 
         // Cache prefix if needed
-        if self.prefix_cache.is_none() || self.prefix_cache_len != prefix_len {
+        if self.prefix_cache.is_empty() || self.prefix_cache_len != prefix_len {
             self.cache_prefix(prefix_ids)?;
         }
         stats.prefix_cached = true;
@@ -99,22 +101,32 @@ impl<'a> WeDLMDecoder<'a> {
         // Track which positions in the block are still MASK
         let mut mask_positions: Vec<usize> = (0..block_size).collect();
 
+        // Pre-allocate reusable buffers to avoid per-step allocations
+        let mut reorder = BlockReorderResult {
+            reordered_block: Vec::with_capacity(block_size),
+            positions: Vec::with_capacity(block_size),
+            block_permutation: Vec::with_capacity(block_size),
+            num_filled: 0,
+        };
+        let mut positions_to_fill: Vec<(usize, u32)> = Vec::with_capacity(block_size);
+
         // Iterate until all MASKs filled
         while !mask_positions.is_empty() {
             stats.steps += 1;
 
-            // Compute reordering entirely on CPU - no GPU readback!
-            let reorder = compute_block_reorder(&block_tokens, &mask_positions, prefix_len);
+            // Compute reordering entirely on CPU into pre-allocated buffers
+            compute_block_reorder_into(&block_tokens, &mask_positions, prefix_len, &mut reorder);
 
             // Upload reordered block and positions to GPU (single upload per step)
-            let reordered_block = Tensor::from_vec(
-                reorder.reordered_block,
+            // Note: from_slice avoids the clone that from_vec would do
+            let reordered_block = Tensor::from_slice(
+                &reorder.reordered_block,
                 (1, block_size),
                 device,
             )?.to_dtype(id_dtype)?;
 
-            let positions_tensor = Tensor::from_vec(
-                reorder.positions,
+            let positions_tensor = Tensor::from_slice(
+                &reorder.positions,
                 (1, block_size),
                 device,
             )?;
@@ -125,20 +137,12 @@ impl<'a> WeDLMDecoder<'a> {
             // Forward pass with:
             // - Reordered block tokens as input
             // - TRUE absolute positions for RoPE
-            // - Cached prefix K/V
+            // - Cached prefix K/V (passed as slice ref, no allocation)
             // - Standard causal attention (Python uses FlashAttn with causal=True)
-            let prefix_caches: Vec<Option<(Tensor, Tensor)>> = self
-                .prefix_cache
-                .as_ref()
-                .unwrap()
-                .iter()
-                .map(|(k, v)| Some((k.clone(), v.clone())))
-                .collect();
-
             let (logits, _block_caches) = self.model.forward_with_positions(
                 &reordered_block,
                 &positions_tensor,
-                Some(&prefix_caches),
+                Some(&self.prefix_cache),
                 None, // Use default causal attention mask
             )?;
 
@@ -168,7 +172,7 @@ impl<'a> WeDLMDecoder<'a> {
             let conf_f32 = confidences.to_dtype(DType::F32)?;
             let conf_vec: Vec<f32> = conf_f32.to_vec1()?;
 
-            let mut positions_to_fill: Vec<(usize, u32)> = Vec::new();
+            positions_to_fill.clear();
             for &reorder_mask_idx in &selected_indices {
                 // Map from reordered MASK index to original block position
                 // MASKs are at the end: positions num_filled_in_block..block_size
@@ -235,31 +239,23 @@ impl<'a> WeDLMDecoder<'a> {
             .collect();
         let positions_tensor = Tensor::from_vec(positions, (1, block_size), device)?;
 
-        // Convert prefix cache to the format expected by forward_with_positions
-        let prefix_caches: Vec<Option<(Tensor, Tensor)>> = self
-            .prefix_cache
-            .as_ref()
-            .map(|caches| {
-                caches.iter().map(|(k, v)| Some((k.clone(), v.clone()))).collect()
-            })
-            .unwrap_or_else(|| vec![None; self.model.num_layers()]);
-
-        // Run just the block with prefix cache - model concatenates K/V internally
+        // Run just the block with prefix cache (passed as slice ref, no clone)
         let (_, new_caches) = self.model.forward_with_positions(
             &block_tensor,
             &positions_tensor,
-            Some(&prefix_caches),
+            Some(&self.prefix_cache),
             None,
         )?;
 
-        self.prefix_cache = Some(new_caches);
+        // Update cache in-place
+        self.prefix_cache = new_caches.into_iter().map(Some).collect();
         self.prefix_cache_len += block_size;
         Ok(())
     }
 
     /// Clear the prefix cache
     pub fn clear_cache(&mut self) {
-        self.prefix_cache = None;
+        self.prefix_cache.clear();
         self.prefix_cache_len = 0;
     }
 
