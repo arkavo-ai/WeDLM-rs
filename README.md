@@ -19,6 +19,7 @@ We thank the Tencent research team for their pioneering work on parallel decodin
 - Metal acceleration for Apple Silicon (M1/M2/M3/M4)
 - F16 precision for optimal memory/performance balance
 - Compatible with HuggingFace WeDLM model weights
+- **WeDLM parallel decoding**: 73+ tokens/sec (28x faster than autoregressive)
 
 ## Model Architecture
 
@@ -55,17 +56,42 @@ huggingface-cli download tencent/WeDLM-8B-Instruct
 
 ### Usage
 
+First, find your model snapshot path:
 ```bash
-# Test model loading and forward pass
-cargo run --features metal --release --bin wedlm-cli -- test \
-  --model ~/.cache/huggingface/hub/models--tencent--WeDLM-8B-Instruct/snapshots/<snapshot-id>
+MODEL_PATH=$(ls -d ~/.cache/huggingface/hub/models--tencent--WeDLM-8B-Instruct/snapshots/*/ | head -1)
+```
 
-# Generate text (autoregressive mode)
-cargo run --features metal --release --bin wedlm-cli -- generate \
-  --model ~/.cache/huggingface/hub/models--tencent--WeDLM-8B-Instruct/snapshots/<snapshot-id> \
+#### Quick Performance Test
+
+```bash
+# Run benchmark to see WeDLM parallel decoding performance
+./target/release/wedlm-cli benchmark --model $MODEL_PATH -n 128
+
+# Expected output on Apple Silicon:
+# WeDLM Parallel: ~73 tok/s (28x faster than autoregressive)
+```
+
+#### Generate Text
+
+```bash
+# WeDLM parallel decoding (default, fastest)
+./target/release/wedlm-cli generate \
+  --model $MODEL_PATH \
+  --prompt "Explain quantum computing in simple terms:" \
+  --max-tokens 128
+
+# Autoregressive mode (for comparison)
+./target/release/wedlm-cli generate \
+  --model $MODEL_PATH \
   --prompt "Hello, world!" \
   --max-tokens 64 \
   --autoregressive
+```
+
+#### Test Model Loading
+
+```bash
+./target/release/wedlm-cli test --model $MODEL_PATH
 ```
 
 ## Project Structure
@@ -98,9 +124,11 @@ src/
 - [x] Weight loading from safetensors
 - [x] Metal acceleration with F16
 - [x] Forward pass verification
-- [ ] Full WeDLM parallel decoding
-- [ ] KV cache optimization
-- [ ] Benchmarking suite
+- [x] WeDLM parallel decoding with topological reordering
+- [x] Prefix KV cache with incremental updates
+- [x] Benchmarking suite (73+ tok/s on Apple Silicon)
+- [ ] Batch processing (batch_size > 1)
+- [ ] Streaming output
 
 ## License
 

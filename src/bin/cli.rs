@@ -45,11 +45,11 @@ enum Commands {
         confidence: f32,
 
         /// Block size for WeDLM parallel decoding
-        #[arg(short, long, default_value = "32")]
+        #[arg(short, long, default_value = "96")]
         block_size: usize,
 
         /// Max tokens to accept per iteration within a block
-        #[arg(long, default_value = "32")]
+        #[arg(long, default_value = "96")]
         max_per_step: usize,
 
         /// Use simple autoregressive decoding instead of WeDLM
@@ -87,7 +87,7 @@ enum Commands {
         temperature: f32,
 
         /// Block size for WeDLM parallel decoding
-        #[arg(short, long, default_value = "32")]
+        #[arg(short, long, default_value = "96")]
         block_size: usize,
 
         /// Confidence threshold for accepting predictions (lower = more aggressive)
@@ -95,7 +95,7 @@ enum Commands {
         confidence: f32,
 
         /// Max tokens to accept per iteration within a block
-        #[arg(long, default_value = "32")]
+        #[arg(long, default_value = "96")]
         max_per_step: usize,
     },
 
