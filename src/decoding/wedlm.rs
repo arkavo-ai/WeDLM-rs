@@ -85,7 +85,6 @@ impl<'a> WeDLMDecoder<'a> {
         params: &SamplingParams,
     ) -> Result<(Tensor, Vec<i64>, BlockStats)> {
         let device = prefix_ids.device();
-        let id_dtype = prefix_ids.dtype();  // I64 for token IDs
         let prefix_len = prefix_ids.dim(1)?;
         let mut stats = BlockStats::default();
 
@@ -118,12 +117,12 @@ impl<'a> WeDLMDecoder<'a> {
             compute_block_reorder_into(&block_tokens, &mask_positions, prefix_len, &mut reorder);
 
             // Upload reordered block and positions to GPU (single upload per step)
-            // Note: from_slice avoids the clone that from_vec would do
+            // Note: from_slice creates I64 tensor directly, no dtype conversion needed
             let reordered_block = Tensor::from_slice(
                 &reorder.reordered_block,
                 (1, block_size),
                 device,
-            )?.to_dtype(id_dtype)?;
+            )?;
 
             let positions_tensor = Tensor::from_slice(
                 &reorder.positions,
@@ -209,7 +208,7 @@ impl<'a> WeDLMDecoder<'a> {
         }
 
         // Build final output
-        let final_block = Tensor::from_vec(block_tokens.clone(), (1, block_size), device)?.to_dtype(id_dtype)?;
+        let final_block = Tensor::from_vec(block_tokens.clone(), (1, block_size), device)?;
         let output_ids = Tensor::cat(&[prefix_ids, &final_block], 1)?;
 
         Ok((output_ids, block_tokens, stats))
