@@ -1,0 +1,52 @@
+[package]
+name = "wedlm-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["Arkavo"]
+description = "WeDLM-8B inference engine in Rust using Candle"
+license = "Apache-2.0"
+
+[dependencies]
+# Core ML framework
+candle-core = "0.9"
+candle-nn = "0.9"
+
+# Weight loading and tokenization
+safetensors = "0.5"
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+
+# Serialization and config
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Utilities
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Memory mapping for efficient weight loading
+memmap2 = "0.9"
+
+# Float types
+half = "2.4"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+[features]
+default = ["metal"]
+metal = ["candle-core/metal"]
+cuda = ["candle-core/cuda"]
+accelerate = ["candle-core/accelerate"]
+
+[[bin]]
+name = "wedlm-cli"
+path = "src/bin/cli.rs"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = true
