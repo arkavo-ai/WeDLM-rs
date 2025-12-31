@@ -143,7 +143,7 @@ pub fn compute_entropies_with_probs(logits: &Tensor, temperature: f32) -> Result
 /// Two-phase sampling: sample only at selected positions from precomputed probs
 ///
 /// Given probs tensor and a list of position indices, samples tokens only for those
-/// positions. Much faster than sampling all positions when acceptance is sparse.
+/// positions. Uses batch index_select + single GPU readback instead of per-position syncs.
 pub fn sample_from_probs_at_indices(
     probs: &Tensor,
     selected_indices: &[usize],
@@ -154,13 +154,19 @@ pub fn sample_from_probs_at_indices(
         return Ok(vec![]);
     }
 
-    // Only read back the selected rows (K instead of N)
+    // Batch: index_select on GPU, single readback (K syncs -> 1 sync)
+    let indices_tensor = Tensor::from_vec(
+        selected_indices.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+        (selected_indices.len(),),
+        probs.device(),
+    )?;
+    let selected_probs = probs.index_select(&indices_tensor, 0)?; // [K, vocab_size]
+    let all_probs: Vec<Vec<f32>> = selected_probs.to_vec2()?; // Single GPU sync
+
     let mut sampled_tokens: Vec<u32> = Vec::with_capacity(selected_indices.len());
     let mut rng = rand::thread_rng();
 
-    for &idx in selected_indices {
-        let pos_probs: Vec<f32> = probs.get(idx)?.to_vec1()?;
-
+    for pos_probs in all_probs {
         let token = if temperature == 0.0 {
             // Greedy: find argmax
             pos_probs
