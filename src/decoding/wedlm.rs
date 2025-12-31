@@ -462,13 +462,17 @@ impl<'a> WeDLMDecoder<'a> {
                 let committed_toks: Vec<i64> = window_tokens.drain(0..n_commit).collect();
                 let _committed_pos: Vec<usize> = window_positions.drain(0..n_commit).collect();
 
-                // Check for EOS
-                let has_eos = committed_toks.iter().any(|&t| t as u32 == self.eos_token_id);
+                // Check for EOS and truncate if mid-commit (don't output tokens after EOS)
+                let eos_pos = committed_toks.iter().position(|&t| t as u32 == self.eos_token_id);
+                let (to_add, has_eos) = match eos_pos {
+                    Some(pos) => (&committed_toks[..=pos], true),  // Include EOS, exclude rest
+                    None => (&committed_toks[..], false),
+                };
 
                 // Add to output
-                output_tokens.extend(&committed_toks);
-                stats.tokens_generated += n_commit;
-                committed_len = new_committed_len;
+                output_tokens.extend(to_add);
+                stats.tokens_generated += to_add.len();
+                committed_len = committed_len + to_add.len();
 
                 if has_eos {
                     break;
