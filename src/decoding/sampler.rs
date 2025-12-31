@@ -117,7 +117,9 @@ pub fn sample_without_margins(
 
 /// Internal sampling implementation
 ///
-/// When `compute_margins` is false, skips the expensive per-position logit copy.
+/// Optimized for minimal GPU sync overhead: uses batch readback (single .to_vec2())
+/// instead of per-position .get(i).to_vec1() calls. When `compute_margins` is false,
+/// skips the logits readback entirely.
 fn sample_impl(
     logits: &Tensor,
     temperature: f32,
@@ -144,9 +146,12 @@ fn sample_impl(
     let entropy_tensor = neg_entropy.sum(D::Minus1)?.neg()?;
     let entropies: Vec<f32> = entropy_tensor.to_vec1()?;
 
-    // Only convert logits to CPU if we need margins
-    let logits_f32 = if compute_margins {
-        Some(scaled_logits.to_dtype(DType::F32)?)
+    // Batch readback: single GPU sync instead of N separate syncs per position
+    let all_probs: Vec<Vec<f32>> = probs_f32.to_vec2()?;
+
+    // Only readback logits if we need margins (single sync)
+    let all_logits: Option<Vec<Vec<f32>>> = if compute_margins {
+        Some(scaled_logits.to_dtype(DType::F32)?.to_vec2()?)
     } else {
         None
     };
@@ -159,12 +164,10 @@ fn sample_impl(
     let mut sampled_tokens: Vec<u32> = Vec::with_capacity(num_positions);
     let mut rng = rand::thread_rng();
 
-    for i in 0..num_positions {
-        let pos_probs: Vec<f32> = probs_f32.get(i)?.to_vec1()?;
-
-        // Compute margin only if requested (avoids logit copy)
-        let top1_idx = if let (Some(ref logits), Some(ref mut m)) = (&logits_f32, &mut margins) {
-            let pos_logits: Vec<f32> = logits.get(i)?.to_vec1()?;
+    for (i, pos_probs) in all_probs.into_iter().enumerate() {
+        // Compute margin only if requested
+        let top1_idx = if let (Some(ref logits_vec), Some(ref mut m)) = (&all_logits, &mut margins) {
+            let pos_logits = &logits_vec[i];
 
             // Find top two logits for margin calculation
             let mut top1_logit = f32::NEG_INFINITY;
