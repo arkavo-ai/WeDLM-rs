@@ -350,6 +350,11 @@ impl<'a> WeDLMDecoder<'a> {
         let mut next_pos = prefix_len;                         // Next absolute position to assign
         let mut output_tokens: Vec<i64> = Vec::new();          // All committed output tokens
 
+        // Dynamic acceptance: track running entropy to adjust parallelism
+        // When model is confident (low entropy), accept more tokens per step
+        let mut running_entropy: f32 = params.entropy_threshold; // Start at threshold (neutral)
+        const ENTROPY_EMA_ALPHA: f32 = 0.3; // Smoothing factor (higher = more responsive)
+
         // 2. Initialize window with MASKs at positions [prefix_len, prefix_len + window_size)
         // Clamp to max_new_tokens to avoid exceeding the limit
         let initial_window = window_size.min(max_new_tokens);
@@ -503,6 +508,26 @@ impl<'a> WeDLMDecoder<'a> {
             let (predictions, entropies) =
                 sample_without_margins(&mask_logits, params.temperature, params.top_p)?;
 
+            // Update running entropy (EMA) for dynamic acceptance
+            if !entropies.is_empty() {
+                let step_avg_entropy = entropies.iter().sum::<f32>() / entropies.len() as f32;
+                running_entropy = ENTROPY_EMA_ALPHA * step_avg_entropy
+                    + (1.0 - ENTROPY_EMA_ALPHA) * running_entropy;
+            }
+
+            // Dynamic max_tokens_per_step based on running entropy
+            // When entropy is low (confident), accept more tokens to reduce forward passes
+            let effective_max = if running_entropy < params.entropy_threshold * 0.4 {
+                // Very confident: up to 2x parallelism
+                params.max_tokens_per_step * 2
+            } else if running_entropy < params.entropy_threshold * 0.7 {
+                // Confident: 1.5x parallelism
+                (params.max_tokens_per_step * 3 + 1) / 2
+            } else {
+                // Normal or high entropy: use preset
+                params.max_tokens_per_step
+            };
+
             // mask_logical_indices are BEFORE we drained n_commit tokens
             // We need to adjust indices for the positions AFTER commit
             // But actually, predictions are for the reordered MASK positions
@@ -512,7 +537,7 @@ impl<'a> WeDLMDecoder<'a> {
                 &mask_logical_indices,
                 params.entropy_threshold,
                 params.distance_penalty,
-                params.max_tokens_per_step,
+                effective_max,
             );
 
             // Fill selected positions
