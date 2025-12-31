@@ -32,10 +32,12 @@ struct QualityMetrics {
 }
 
 impl QualityMetrics {
-    /// Thresholds for quality gate
-    const MAX_REPEATS_THRESHOLD: usize = 5;
-    const REPEAT_RATIO_THRESHOLD: f32 = 0.4;
-    const MAX_PUNCT_THRESHOLD: usize = 4;
+    /// Thresholds for quality gate (tuned from sweep data)
+    /// Good output: repeats=1-4, ratio=0.62-0.70, punct=1-4
+    /// Bad output:  repeats=15-30, ratio=0.83-0.94, punct=16-31
+    const MAX_REPEATS_THRESHOLD: usize = 8;
+    const REPEAT_RATIO_THRESHOLD: f32 = 0.78;
+    const MAX_PUNCT_THRESHOLD: usize = 10;
 
     /// Compute quality metrics from generated tokens and text
     fn compute(tokens: &[u32], text: &str) -> Self {
