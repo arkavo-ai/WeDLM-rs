@@ -115,6 +115,71 @@ pub fn sample_without_margins(
     Ok((predictions, entropies))
 }
 
+/// Two-phase sampling: compute entropies and return probs tensor for later sampling
+///
+/// Returns (entropies, probs_tensor). Use with `sample_from_probs_tensor`
+/// to sample only the positions you actually need (avoiding double softmax).
+pub fn compute_entropies_with_probs(logits: &Tensor, temperature: f32) -> Result<(Vec<f32>, Tensor)> {
+    // Apply temperature scaling
+    let scaled_logits = if temperature > 0.0 && temperature != 1.0 {
+        (logits / temperature as f64)?
+    } else {
+        logits.clone()
+    };
+
+    // Compute softmax probabilities (once!)
+    let probs = candle_nn::ops::softmax(&scaled_logits, D::Minus1)?;
+    let probs_f32 = probs.to_dtype(DType::F32)?;
+
+    // Compute entropy for each position: H = -sum(p * log(p))
+    let log_probs = (probs_f32.clone() + 1e-10)?.log()?;
+    let neg_entropy = (&probs_f32 * log_probs)?;
+    let entropy_tensor = neg_entropy.sum(D::Minus1)?.neg()?;
+    let entropies: Vec<f32> = entropy_tensor.to_vec1()?;
+
+    Ok((entropies, probs_f32))
+}
+
+/// Two-phase sampling: sample only at selected positions from precomputed probs
+///
+/// Given probs tensor and a list of position indices, samples tokens only for those
+/// positions. Much faster than sampling all positions when acceptance is sparse.
+pub fn sample_from_probs_at_indices(
+    probs: &Tensor,
+    selected_indices: &[usize],
+    temperature: f32,
+    top_p: f32,
+) -> Result<Vec<u32>> {
+    if selected_indices.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Only read back the selected rows (K instead of N)
+    let mut sampled_tokens: Vec<u32> = Vec::with_capacity(selected_indices.len());
+    let mut rng = rand::thread_rng();
+
+    for &idx in selected_indices {
+        let pos_probs: Vec<f32> = probs.get(idx)?.to_vec1()?;
+
+        let token = if temperature == 0.0 {
+            // Greedy: find argmax
+            pos_probs
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0)
+        } else if top_p >= 1.0 {
+            sample_from_probs(&pos_probs, &mut rng)
+        } else {
+            sample_nucleus(&pos_probs, top_p, &mut rng)
+        };
+        sampled_tokens.push(token);
+    }
+
+    Ok(sampled_tokens)
+}
+
 /// Internal sampling implementation
 ///
 /// Optimized for minimal GPU sync overhead: uses batch readback (single .to_vec2())

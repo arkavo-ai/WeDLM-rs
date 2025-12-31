@@ -20,7 +20,10 @@ use crate::model::WeDLMForCausalLM;
 use crate::MASK_TOKEN_ID;
 
 use super::reorder::{compute_block_reorder_into, BlockReorderResult};
-use super::sampler::{sample_without_margins, select_by_entropy_with_distance, SamplingParams};
+use super::sampler::{
+    compute_entropies_with_probs, sample_from_probs_at_indices, select_by_entropy_with_distance,
+    SamplingParams,
+};
 
 /// Entropy threshold for reducing block size (soft limit)
 pub const ENTROPY_SOFT_THRESHOLD: f32 = 8.0;
@@ -173,9 +176,9 @@ impl<'a> WeDLMDecoder<'a> {
             // MASKs are at positions num_filled_in_block..block_size in reordered output
             let mask_logits = logits_2d.narrow(0, num_filled_in_block, num_mask)?;
 
-            // Sample with entropy calculation (no margins needed for distance-penalized selection)
-            let (predictions, entropies) =
-                sample_without_margins(&mask_logits, params.temperature, params.top_p)?;
+            // Two-phase sampling: compute entropies + probs once, then sample only selected
+            // Phase 1: Compute entropies and get probs tensor (single softmax)
+            let (entropies, probs) = compute_entropies_with_probs(&mask_logits, params.temperature)?;
 
             // Get original block positions for MASK tokens (for ordering)
             // MASKs are at the end of block_permutation after reordering
@@ -197,16 +200,17 @@ impl<'a> WeDLMDecoder<'a> {
                 break;
             }
 
-            // Update block tokens with predictions
-            let pred_vec: Vec<u32> = predictions.to_vec1()?;
+            // Phase 2: Sample only at selected positions (reuses probs tensor)
+            let sampled_tokens =
+                sample_from_probs_at_indices(&probs, &selected_indices, params.temperature, params.top_p)?;
 
             positions_to_fill.clear();
-            for &reorder_mask_idx in &selected_indices {
+            for (i, &reorder_mask_idx) in selected_indices.iter().enumerate() {
                 // Map from reordered MASK index to original block position
                 // MASKs are at the end: positions num_filled_in_block..block_size
                 let reordered_block_pos = num_filled_in_block + reorder_mask_idx;
                 let original_block_pos = reorder.block_permutation[reordered_block_pos];
-                let predicted_token = pred_vec[reorder_mask_idx];
+                let predicted_token = sampled_tokens[i];
 
                 positions_to_fill.push((original_block_pos, predicted_token));
 
@@ -500,13 +504,15 @@ impl<'a> WeDLMDecoder<'a> {
             }
 
             // ============================================================
-            // STEP E: Predict + Fill using distance-penalized entropy
+            // STEP E: Two-phase sampling for efficiency
+            // Phase 1: Compute entropies + probs (single softmax)
+            // Phase 2: Sample only selected positions (sparse acceptance)
             // ============================================================
             let logits_2d = logits.squeeze(0)?;
             let mask_logits = logits_2d.narrow(0, num_filled, num_mask)?;
 
-            let (predictions, entropies) =
-                sample_without_margins(&mask_logits, params.temperature, params.top_p)?;
+            // Phase 1: Compute entropies and get probs tensor (single softmax)
+            let (entropies, probs) = compute_entropies_with_probs(&mask_logits, params.temperature)?;
 
             // Update running entropy (EMA) for dynamic acceptance
             if !entropies.is_empty() {
@@ -528,10 +534,7 @@ impl<'a> WeDLMDecoder<'a> {
                 params.max_tokens_per_step
             };
 
-            // mask_logical_indices are BEFORE we drained n_commit tokens
-            // We need to adjust indices for the positions AFTER commit
-            // But actually, predictions are for the reordered MASK positions
-            // which don't change - the reordering was done before commit
+            // Select positions based on entropy (before sampling)
             let selected = select_by_entropy_with_distance(
                 &entropies,
                 &mask_logical_indices,
@@ -540,17 +543,20 @@ impl<'a> WeDLMDecoder<'a> {
                 effective_max,
             );
 
+            // Phase 2: Sample only at selected positions (reuses probs tensor)
+            let sampled_tokens =
+                sample_from_probs_at_indices(&probs, &selected, params.temperature, params.top_p)?;
+
             // Fill selected positions
             // Note: mask_logical_indices are in pre-commit window space
             // After draining n_commit, indices shift by -n_commit
-            let pred_vec: Vec<u32> = predictions.to_vec1()?;
-            for &sel_idx in &selected {
+            for (i, &sel_idx) in selected.iter().enumerate() {
                 let pre_commit_pos = mask_logical_indices[sel_idx];
                 // After draining n_commit, position shifts down
                 let post_commit_pos = pre_commit_pos.saturating_sub(n_commit);
 
                 if post_commit_pos < window_tokens.len() {
-                    let predicted_token = pred_vec[sel_idx];
+                    let predicted_token = sampled_tokens[i];
                     window_tokens[post_commit_pos] = predicted_token as i64;
 
                     // Track entropy stats
