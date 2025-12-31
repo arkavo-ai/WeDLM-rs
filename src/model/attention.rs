@@ -183,26 +183,44 @@ impl WeDLMAttention {
         // Store KV for cache
         let new_kv = (k.clone(), v.clone());
 
-        // 7. Expand KV heads for GQA
-        let k = self.repeat_kv(&k)?;
-        let v = self.repeat_kv(&v)?;
+        // 7. Attention computation
+        // Use fused SDPA on Metal/CUDA, fall back to manual on CPU
+        let attn_output = if q.device().is_cpu() {
+            // CPU fallback: manual attention (SDPA has no CPU impl)
+            let k_expanded = self.repeat_kv(&k)?;
+            let v_expanded = self.repeat_kv(&v)?;
+            let attn_weights = (q.matmul(&k_expanded.transpose(2, 3)?)? * self.scale)?;
+            let attn_weights = match attention_mask {
+                Some(mask) => attn_weights.broadcast_add(mask)?,
+                None => attn_weights,
+            };
+            let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
+            attn_weights.matmul(&v_expanded)?
+        } else {
+            // GPU: Fused SDPA kernel
+            // - Handles GQA natively (no repeat_kv needed)
+            // - Fuses: matmul, scale, mask, softmax, matmul into single kernel
+            // - Uses Metal-optimized SDPA kernels
+            //
+            // SDPA requires mask shape [bs, num_heads, qseq, kseq]
+            let kv_seq = k.dim(2)?;
+            let expanded_mask = match attention_mask {
+                Some(mask) => Some(mask.broadcast_as((batch_size, self.num_heads, seq_len, kv_seq))?),
+                None => None,
+            };
 
-        // 8. Compute attention scores: [batch, heads, q_seq, kv_seq]
-        let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * self.scale)?;
-
-        // 9. Apply attention mask (additive mask with -inf for masked positions)
-        let attn_weights = match attention_mask {
-            Some(mask) => attn_weights.broadcast_add(mask)?,
-            None => attn_weights,
+            candle_nn::ops::sdpa(
+                &q,                           // [batch, num_heads, seq, head_dim]
+                &k,                           // [batch, num_kv_heads, kv_seq, head_dim]
+                &v,                           // [batch, num_kv_heads, kv_seq, head_dim]
+                expanded_mask.as_ref(),       // Expanded mask [batch, num_heads, qseq, kseq]
+                false,                        // do_causal=false since we provide explicit mask
+                self.scale as f32,            // 1/sqrt(head_dim)
+                1.0,                          // softcapping=1.0 means disabled
+            )?
         };
 
-        // 10. Softmax
-        let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
-
-        // 11. Apply attention to values
-        let attn_output = attn_weights.matmul(&v)?;
-
-        // 12. Reshape back: [batch, heads, seq, head_dim] -> [batch, seq, hidden_size]
+        // 8. Reshape back: [batch, heads, seq, head_dim] -> [batch, seq, hidden_size]
         let attn_output = attn_output
             .transpose(1, 2)?
             .reshape((batch_size, seq_len, self.num_heads * self.head_dim))?;
@@ -213,7 +231,7 @@ impl WeDLMAttention {
         Ok((output, new_kv))
     }
 
-    /// Repeat KV heads for grouped query attention
+    /// Repeat KV heads for grouped query attention (used in CPU fallback)
     ///
     /// Input: [batch, num_kv_heads, seq, head_dim]
     /// Output: [batch, num_heads, seq, head_dim]

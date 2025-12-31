@@ -119,6 +119,9 @@ pub fn sample_without_margins(
 ///
 /// Returns (entropies, probs_tensor). Use with `sample_from_probs_tensor`
 /// to sample only the positions you actually need (avoiding double softmax).
+///
+/// Optimization: Entropy is computed on CPU after single batch readback,
+/// avoiding GPU intermediate tensors for log/sum/neg operations.
 pub fn compute_entropies_with_probs(logits: &Tensor, temperature: f32) -> Result<(Vec<f32>, Tensor)> {
     // Apply temperature scaling
     let scaled_logits = if temperature > 0.0 && temperature != 1.0 {
@@ -127,15 +130,25 @@ pub fn compute_entropies_with_probs(logits: &Tensor, temperature: f32) -> Result
         logits.clone()
     };
 
-    // Compute softmax probabilities (once!)
+    // Compute softmax probabilities on GPU
     let probs = candle_nn::ops::softmax(&scaled_logits, D::Minus1)?;
     let probs_f32 = probs.to_dtype(DType::F32)?;
 
-    // Compute entropy for each position: H = -sum(p * log(p))
-    let log_probs = (probs_f32.clone() + 1e-10)?.log()?;
-    let neg_entropy = (&probs_f32 * log_probs)?;
-    let entropy_tensor = neg_entropy.sum(D::Minus1)?.neg()?;
-    let entropies: Vec<f32> = entropy_tensor.to_vec1()?;
+    // Read all probs to CPU with single batch readback
+    let all_probs: Vec<Vec<f32>> = probs_f32.to_vec2()?;
+
+    // Compute entropy on CPU: H = -sum(p * log(p))
+    // This avoids GPU intermediate tensors for log, mul, sum, neg
+    let entropies: Vec<f32> = all_probs
+        .iter()
+        .map(|pos_probs| {
+            pos_probs
+                .iter()
+                .filter(|&&p| p > 0.0)
+                .map(|&p| -p * p.ln())
+                .sum()
+        })
+        .collect();
 
     Ok((entropies, probs_f32))
 }

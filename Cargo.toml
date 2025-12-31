@@ -7,9 +7,9 @@ description = "WeDLM-8B inference engine in Rust using Candle"
 license = "Apache-2.0"
 
 [dependencies]
-# Core ML framework
-candle-core = "0.9"
-candle-nn = "0.9"
+# Core ML framework (local build for SDPA with mask support)
+candle-core = { path = "../candle/candle-core" }
+candle-nn = { path = "../candle/candle-nn" }
 
 # Weight loading and tokenization
 safetensors = "0.5"
