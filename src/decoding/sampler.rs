@@ -30,7 +30,7 @@ impl Default for SamplingParams {
     fn default() -> Self {
         Self {
             temperature: 0.2,
-            top_p: 0.9,
+            top_p: 1.0, // No nucleus filtering - avoids O(n log n) sort per position
             // Conservative default for quality - use higher for speed at quality cost
             entropy_threshold: 0.6,
             // Distance penalty λ for H̃ = H + λ·d selection (paper default)
