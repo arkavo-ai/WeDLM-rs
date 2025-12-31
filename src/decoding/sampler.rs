@@ -156,7 +156,7 @@ fn sample_impl(
     } else {
         None
     };
-    let mut sampled_tokens = Vec::with_capacity(num_positions);
+    let mut sampled_tokens: Vec<u32> = Vec::with_capacity(num_positions);
     let mut rng = rand::thread_rng();
 
     for i in 0..num_positions {
@@ -206,10 +206,10 @@ fn sample_impl(
             // Nucleus (top-p) sampling
             sample_nucleus(&pos_probs, top_p, &mut rng)
         };
-        sampled_tokens.push(token as i64);
+        sampled_tokens.push(token);
     }
 
-    // Create predictions tensor
+    // Create predictions tensor (U32 dtype for token IDs)
     let predictions = Tensor::from_vec(sampled_tokens, (num_positions,), device)?;
 
     Ok((predictions, entropies, margins))

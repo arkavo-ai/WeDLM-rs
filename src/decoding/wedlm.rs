@@ -20,7 +20,7 @@ use crate::model::WeDLMForCausalLM;
 use crate::MASK_TOKEN_ID;
 
 use super::reorder::{compute_block_reorder_into, BlockReorderResult};
-use super::sampler::{sample_with_entropy_and_top_p, sample_without_margins, select_by_entropy_with_distance, select_by_entropy_with_margin, SamplingParams};
+use super::sampler::{sample_without_margins, select_by_entropy_with_distance, SamplingParams};
 
 /// Entropy threshold for reducing block size (soft limit)
 pub const ENTROPY_SOFT_THRESHOLD: f32 = 8.0;
@@ -173,9 +173,9 @@ impl<'a> WeDLMDecoder<'a> {
             // MASKs are at positions num_filled_in_block..block_size in reordered output
             let mask_logits = logits_2d.narrow(0, num_filled_in_block, num_mask)?;
 
-            // Sample with entropy and margin calculation for dual-gate selection
-            let (predictions, entropies, margins) =
-                sample_with_entropy_and_top_p(&mask_logits, params.temperature, params.top_p)?;
+            // Sample with entropy calculation (no margins needed for distance-penalized selection)
+            let (predictions, entropies) =
+                sample_without_margins(&mask_logits, params.temperature, params.top_p)?;
 
             // Get original block positions for MASK tokens (for ordering)
             // MASKs are at the end of block_permutation after reordering
@@ -183,15 +183,13 @@ impl<'a> WeDLMDecoder<'a> {
                 .map(|i| reorder.block_permutation[i])
                 .collect();
 
-            // Select positions using monotonic acceptance with dual gate:
-            // 1. Entropy must be below threshold
-            // 2. Margin (logit_top1 - logit_top2) must be above threshold
-            let selected_indices = select_by_entropy_with_margin(
+            // Select positions using distance-penalized entropy (Eq. 11 from paper):
+            // H̃_i = H_i + λ·d_i where d_i = distance to leftmost MASK
+            let selected_indices = select_by_entropy_with_distance(
                 &entropies,
-                &margins,
                 &mask_original_positions,
                 params.entropy_threshold,
-                params.margin_threshold,
+                params.distance_penalty,
                 params.max_tokens_per_step,
             );
 
