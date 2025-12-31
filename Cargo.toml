@@ -40,9 +40,9 @@ hf-hub = "0.3"
 
 [features]
 default = ["metal"]
-metal = ["candle-core/metal"]
-cuda = ["candle-core/cuda"]
-accelerate = ["candle-core/accelerate"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
 
 [[bin]]
 name = "wedlm-cli"

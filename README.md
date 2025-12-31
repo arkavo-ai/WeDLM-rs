@@ -52,9 +52,9 @@ Generating...
 Explain quantum computing in simple terms: Traditional computers use bits...
 
 --- Stats ---
-Time: 10.5s
+Time: 11.3s
 Tokens generated: 128
-Speed: 12.2 tok/s
+Speed: 11.3 tok/s
 ```
 
 ---
@@ -86,9 +86,9 @@ cargo run --release -- benchmark \
   -n 128
 
 # You'll see something like:
-# Autoregressive:  50.0s avg (2.6 tok/s)
-# WeDLM Parallel:  10.5s avg (12.2 tok/s)
-# WeDLM is 4.8x FASTER than autoregressive
+# Autoregressive:  14.1s avg (4.5 tok/s)
+# WeDLM Parallel:   5.7s avg (11.3 tok/s)
+# WeDLM is 2.5x FASTER than autoregressive
 ```
 
 ### All Options
@@ -127,7 +127,7 @@ Standard (autoregressive):  Token → Token → Token → Token  (slow)
 WeDLM (parallel):           [Token Token Token Token]      (fast!)
 ```
 
-The model predicts a block of tokens simultaneously, then refines them. This achieves **~4.8x speedup** over standard autoregressive decoding on Apple Silicon.
+The model predicts a block of tokens simultaneously, then refines them. This achieves **~2.5x speedup** over standard autoregressive decoding on Apple Silicon.
 
 ---
 
@@ -150,6 +150,28 @@ cargo build --release --no-default-features
 ```bash
 cargo build --release --no-default-features --features cuda
 ```
+
+---
+
+## Performance Tuning
+
+### Metal Command Buffer Batching
+
+On Apple Silicon, you can improve throughput by increasing the number of compute operations batched per Metal command buffer:
+
+```bash
+CANDLE_METAL_COMPUTE_PER_BUFFER=200 ./target/release/wedlm-cli generate \
+  -m tencent/WeDLM-8B-Instruct \
+  -p "Your prompt here"
+```
+
+| Setting | Default | Optimized |
+|---------|---------|-----------|
+| `CANDLE_METAL_COMPUTE_PER_BUFFER` | 50 | 200 |
+| WeDLM Throughput | ~10 tok/s | ~11 tok/s (+10%) |
+| AR Throughput | ~4.0 tok/s | ~4.5 tok/s (+12%) |
+
+> **Note**: Tested on M1 Max (32-core GPU, 32GB). Optimal value may vary by GPU.
 
 ---
 

@@ -4,8 +4,10 @@
 //! - theta = 1,000,000.0 (WeDLM uses high theta for long context)
 //! - head_dim = 128 -> 64 inverse frequencies
 //! - Formula: inv_freq[i] = 1.0 / (theta ^ (2*i / head_dim))
+//!
+//! Uses candle_nn's fused RoPE kernel for Metal acceleration.
 
-use candle_core::{DType, Device, Result, Tensor, D};
+use candle_core::{DType, Device, Result, Tensor};
 
 /// Precomputed rotary position embeddings
 pub struct RotaryEmbedding {
@@ -54,8 +56,9 @@ impl RotaryEmbedding {
         let inv_freq = Tensor::from_vec(inv_freq, (half_dim,), device)?;
 
         // Precompute cos/sin for all positions up to max_seq_len
+        // Shape: [max_seq_len, head_dim/2] for fused kernel
         let (cos_cache, sin_cache) =
-            Self::compute_cos_sin(&inv_freq, max_seq_len, head_dim, dtype, device)?;
+            Self::compute_cos_sin(&inv_freq, max_seq_len, dtype, device)?;
 
         Ok(Self {
             inv_freq,
@@ -67,10 +70,12 @@ impl RotaryEmbedding {
     }
 
     /// Compute cosine and sine values for a range of positions
+    ///
+    /// Stores cos/sin with shape [seq_len, head_dim/2] for use with
+    /// candle_nn's fused RoPE kernel.
     fn compute_cos_sin(
         inv_freq: &Tensor,
         seq_len: usize,
-        _head_dim: usize,
         dtype: DType,
         device: &Device,
     ) -> Result<(Tensor, Tensor)> {
@@ -82,16 +87,12 @@ impl RotaryEmbedding {
         let inv_freq = inv_freq.unsqueeze(0)?;
 
         // freqs = positions @ inv_freq.T -> [seq_len, half_dim]
-        // In Python: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
         let freqs = positions.matmul(&inv_freq)?;
 
-        // Concatenate to get full head_dim: [seq_len, head_dim]
-        // emb = torch.cat((freqs, freqs), dim=-1)
-        let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?;
-
-        // Compute cos and sin
-        let cos = emb.cos()?.to_dtype(dtype)?;
-        let sin = emb.sin()?.to_dtype(dtype)?;
+        // Compute cos and sin - keep as [seq_len, half_dim] for fused kernel
+        // Store in f32 for numerical stability during computation
+        let cos = freqs.cos()?.to_dtype(dtype)?;
+        let sin = freqs.sin()?.to_dtype(dtype)?;
 
         Ok((cos, sin))
     }
@@ -144,13 +145,13 @@ impl RotaryEmbedding {
         Ok((cos, sin))
     }
 
-    /// Apply rotary embeddings to query and key tensors
+    /// Apply rotary embeddings to query and key tensors using fused kernel
     ///
     /// # Arguments
     /// * `q` - Query tensor of shape [batch, num_heads, seq_len, head_dim]
     /// * `k` - Key tensor of shape [batch, num_kv_heads, seq_len, head_dim]
-    /// * `cos` - Cosine values [seq_len, head_dim]
-    /// * `sin` - Sine values [seq_len, head_dim]
+    /// * `cos` - Cosine values [seq_len, head_dim/2]
+    /// * `sin` - Sine values [seq_len, head_dim/2]
     ///
     /// # Returns
     /// (q_rotated, k_rotated) with same shapes as input
@@ -160,53 +161,40 @@ impl RotaryEmbedding {
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
-        // Reshape cos/sin for broadcasting: [1, 1, seq_len, head_dim]
-        let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
-        let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
+        // Fused kernel requires matching dtypes and contiguous tensors
+        let q_dtype = q.dtype();
+        let k_dtype = k.dtype();
 
-        let q_rotated = Self::apply_rotary_emb(q, &cos, &sin)?;
-        let k_rotated = Self::apply_rotary_emb(k, &cos, &sin)?;
+        // Convert cos/sin to match input dtype for fused kernel
+        let cos_q = cos.to_dtype(q_dtype)?;
+        let sin_q = sin.to_dtype(q_dtype)?;
+
+        // Make inputs contiguous if needed (fused kernel requirement)
+        let q_contig = if q.is_contiguous() {
+            q.clone()
+        } else {
+            q.contiguous()?
+        };
+        let k_contig = if k.is_contiguous() {
+            k.clone()
+        } else {
+            k.contiguous()?
+        };
+
+        // Use candle_nn's fused RoPE kernel (Metal accelerated)
+        let q_rotated = candle_nn::rotary_emb::rope(&q_contig, &cos_q, &sin_q)?;
+
+        // For k, convert cos/sin if dtypes differ (unlikely but safe)
+        let k_rotated = if k_dtype == q_dtype {
+            candle_nn::rotary_emb::rope(&k_contig, &cos_q, &sin_q)?
+        } else {
+            let cos_k = cos.to_dtype(k_dtype)?;
+            let sin_k = sin.to_dtype(k_dtype)?;
+            candle_nn::rotary_emb::rope(&k_contig, &cos_k, &sin_k)?
+        };
 
         Ok((q_rotated, k_rotated))
     }
-
-    /// Apply rotary embedding to a single tensor
-    fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-        // x shape: [batch, heads, seq, head_dim]
-        // CRITICAL: Compute in f32 for numerical stability (matches Python)
-        let input_dtype = x.dtype();
-        let x_f32 = x.to_dtype(DType::F32)?;
-        let cos_f32 = cos.to_dtype(DType::F32)?;
-        let sin_f32 = sin.to_dtype(DType::F32)?;
-
-        // q_embed = (q * cos) + (rotate_half(q) * sin)
-        let x_rotated = rotate_half(&x_f32)?;
-        let result = (x_f32.broadcast_mul(&cos_f32)? + x_rotated.broadcast_mul(&sin_f32)?)?;
-
-        // Convert back to original dtype
-        result.to_dtype(input_dtype)
-    }
-}
-
-/// Rotate half the hidden dimensions
-///
-/// CRITICAL: Must match Python exactly:
-/// ```python
-/// x1 = x[..., : x.shape[-1] // 2]
-/// x2 = x[..., x.shape[-1] // 2 :]
-/// return torch.cat((-x2, x1), dim=-1)
-/// ```
-fn rotate_half(x: &Tensor) -> Result<Tensor> {
-    let last_dim = x.dim(D::Minus1)?;
-    let half = last_dim / 2;
-
-    // Split into first and second halves
-    let x1 = x.narrow(D::Minus1, 0, half)?;
-    let x2 = x.narrow(D::Minus1, half, half)?;
-
-    // Negate x2 and concatenate: (-x2, x1)
-    let neg_x2 = x2.neg()?;
-    Tensor::cat(&[&neg_x2, &x1], D::Minus1)
 }
 
 #[cfg(test)]
@@ -232,26 +220,27 @@ mod tests {
         let rope = RotaryEmbedding::new(128, 1024, 1_000_000.0, DType::F32, &Device::Cpu)?;
 
         let (cos, sin) = rope.get_cos_sin(10, 0)?;
-        assert_eq!(cos.dims(), &[10, 128]);
-        assert_eq!(sin.dims(), &[10, 128]);
+        // Shape is now [seq_len, head_dim/2] for fused kernel
+        assert_eq!(cos.dims(), &[10, 64]);
+        assert_eq!(sin.dims(), &[10, 64]);
 
         Ok(())
     }
 
     #[test]
-    fn test_rotate_half() -> Result<()> {
-        // Test with simple values
-        let x = Tensor::from_vec(
-            vec![1.0f32, 2.0, 3.0, 4.0],
-            (1, 1, 1, 4),
-            &Device::Cpu,
-        )?;
+    fn test_fused_rope_apply() -> Result<()> {
+        let rope = RotaryEmbedding::new(128, 32, 1_000_000.0, DType::F32, &Device::Cpu)?;
 
-        let rotated = rotate_half(&x)?;
-        let result: Vec<f32> = rotated.flatten_all()?.to_vec1()?;
+        // Create dummy q and k tensors: [batch, heads, seq, head_dim]
+        let q = Tensor::ones((1, 4, 8, 128), DType::F32, &Device::Cpu)?;
+        let k = Tensor::ones((1, 4, 8, 128), DType::F32, &Device::Cpu)?;
 
-        // (-x2, x1) = (-3, -4, 1, 2)
-        assert_eq!(result, vec![-3.0, -4.0, 1.0, 2.0]);
+        let (cos, sin) = rope.get_cos_sin(8, 0)?;
+        let (q_rot, k_rot) = RotaryEmbedding::apply(&q, &k, &cos, &sin)?;
+
+        // Output shapes should match input
+        assert_eq!(q_rot.dims(), q.dims());
+        assert_eq!(k_rot.dims(), k.dims());
 
         Ok(())
     }
