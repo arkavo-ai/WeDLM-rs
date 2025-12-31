@@ -52,9 +52,9 @@ Generating...
 Explain quantum computing in simple terms: Traditional computers use bits...
 
 --- Stats ---
-TTS (time to generate): 1.75s
-Tokens generated: ~5000
-Speed: 73.9 tok/s
+Time: 16.06s
+Tokens generated: 128
+Speed: 8.0 tok/s
 ```
 
 ---
@@ -86,9 +86,9 @@ cargo run --release -- benchmark \
   -n 128
 
 # You'll see something like:
-# Autoregressive:  5.12s avg (25.0 tok/s)
-# WeDLM Parallel:  1.75s avg (73.1 tok/s)
-# WeDLM is 2.93x FASTER than autoregressive
+# Autoregressive:  49.07s avg (2.6 tok/s)
+# WeDLM Parallel:  16.06s avg (8.0 tok/s)
+# WeDLM is 3.05x FASTER than autoregressive
 ```
 
 ### All Options
@@ -127,7 +127,7 @@ Standard (autoregressive):  Token → Token → Token → Token  (slow)
 WeDLM (parallel):           [Token Token Token Token]      (fast!)
 ```
 
-The model predicts a block of tokens simultaneously, then refines them. This achieves **73+ tokens/sec** on Apple Silicon — about **28x faster** than standard decoding.
+The model predicts a block of tokens simultaneously, then refines them. This achieves **~3x speedup** over standard autoregressive decoding on Apple Silicon.
 
 ---
 
@@ -157,7 +157,7 @@ cargo build --release --no-default-features --features cuda
 
 Based on the WeDLM architecture by Tencent:
 
-- **Paper**: [WeDLM: Weighted Diffusion Language Model](https://arxiv.org/abs/2505.18567)
+- **Paper**: [WeDLM: Reconciling Diffusion Language Models with Standard Causal Attention for Fast Inference](https://arxiv.org/abs/2512.22737)
 - **Original**: [github.com/Tencent/WeDLM](https://github.com/Tencent/WeDLM)
 
 ---
