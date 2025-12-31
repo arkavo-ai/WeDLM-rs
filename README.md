@@ -52,9 +52,9 @@ Generating...
 Explain quantum computing in simple terms: Traditional computers use bits...
 
 --- Stats ---
-Time: 13.5s
+Time: 11.0s
 Tokens generated: 128
-Speed: 9.5 tok/s
+Speed: 11.7 tok/s
 ```
 
 ---
@@ -87,8 +87,8 @@ cargo run --release -- benchmark \
 
 # You'll see something like:
 # Autoregressive:  49.9s avg (2.6 tok/s)
-# WeDLM Parallel:  13.5s avg (9.5 tok/s)
-# WeDLM is 3.7x FASTER than autoregressive
+# WeDLM Parallel:  11.0s avg (11.7 tok/s)
+# WeDLM is 4.5x FASTER than autoregressive
 ```
 
 ### All Options
@@ -127,7 +127,7 @@ Standard (autoregressive):  Token → Token → Token → Token  (slow)
 WeDLM (parallel):           [Token Token Token Token]      (fast!)
 ```
 
-The model predicts a block of tokens simultaneously, then refines them. This achieves **~3.7x speedup** over standard autoregressive decoding on Apple Silicon.
+The model predicts a block of tokens simultaneously, then refines them. This achieves **~4.5x speedup** over standard autoregressive decoding on Apple Silicon.
 
 ---
 
