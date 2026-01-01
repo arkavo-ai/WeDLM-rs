@@ -12,6 +12,17 @@ use crate::model::WeDLMForCausalLM;
 use crate::weights::load_model_vb;
 use crate::MASK_TOKEN_ID;
 
+/// Apply WeDLM chat template to a user prompt
+///
+/// WeDLM-8B-Instruct uses the im_start/im_end format:
+/// <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
+fn apply_chat_template(prompt: &str) -> String {
+    format!(
+        "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+        prompt
+    )
+}
+
 /// High-level inference engine
 pub struct WeDLMEngine {
     model: WeDLMForCausalLM,
@@ -88,26 +99,30 @@ impl WeDLMEngine {
         prompt: &str,
         max_new_tokens: usize,
         params: Option<SamplingParams>,
-    ) -> Result<String> {
+    ) -> Result<(String, usize)> {
         self.generate_with_block_size(prompt, max_new_tokens, crate::DEFAULT_BLOCK_SIZE, params)
     }
 
     /// Generate text using WeDLM streaming parallel decoding
     ///
     /// Uses Algorithm 1 from the WeDLM paper with sliding window.
+    /// Returns (output_text, tokens_generated).
     pub fn generate_with_block_size(
         &self,
         prompt: &str,
         max_new_tokens: usize,
         window_size: usize,
         params: Option<SamplingParams>,
-    ) -> Result<String> {
+    ) -> Result<(String, usize)> {
         let params = params.unwrap_or_default();
+
+        // Apply chat template for instruction-tuned model
+        let formatted_prompt = apply_chat_template(prompt);
 
         // Tokenize input
         let encoding = self
             .tokenizer
-            .encode(prompt, false)
+            .encode(formatted_prompt.as_str(), false)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
         let prompt_ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
 
@@ -123,36 +138,41 @@ impl WeDLMEngine {
         let mut decoder = WeDLMDecoder::new(&self.model, Some(MASK_TOKEN_ID));
 
         // Generate using streaming (Algorithm 1)
-        let (output_ids, _stats) = decoder.generate_streaming(&prompt_tensor, max_new_tokens, window_size, &params)?;
+        let (output_ids, stats) = decoder.generate_streaming(&prompt_tensor, max_new_tokens, window_size, &params)?;
 
-        // Decode output
-        let output_vec: Vec<u32> = output_ids
-            .squeeze(0)?
-            .to_vec1::<i64>()?
+        // Decode only the generated portion (skip prompt tokens)
+        let all_ids: Vec<i64> = output_ids.squeeze(0)?.to_vec1()?;
+        let generated_ids: Vec<u32> = all_ids[prompt_ids.len()..]
             .iter()
             .map(|&x| x as u32)
             .collect();
+
         let text = self
             .tokenizer
-            .decode(&output_vec, true)
+            .decode(&generated_ids, true)
             .map_err(|e| anyhow::anyhow!("Decoding failed: {}", e))?;
 
-        Ok(text)
+        Ok((text, stats.tokens_generated))
     }
 
     /// Simple autoregressive generation (for comparison/debugging)
+    /// Returns (output_text, tokens_generated).
     pub fn generate_autoregressive(
         &self,
         prompt: &str,
         max_new_tokens: usize,
         temperature: f32,
-    ) -> Result<String> {
+    ) -> Result<(String, usize)> {
+        // Apply chat template for instruction-tuned model
+        let formatted_prompt = apply_chat_template(prompt);
+
         // Tokenize
         let encoding = self
             .tokenizer
-            .encode(prompt, false)
+            .encode(formatted_prompt.as_str(), false)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
         let mut ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
+        let prompt_len = ids.len();
 
         // Generate token by token
         for _ in 0..max_new_tokens {
@@ -184,14 +204,16 @@ impl WeDLMEngine {
             }
         }
 
-        // Decode
-        let output_ids: Vec<u32> = ids.iter().map(|&x| x as u32).collect();
+        // Decode only the generated portion (skip prompt tokens)
+        let generated_ids: Vec<u32> = ids[prompt_len..].iter().map(|&x| x as u32).collect();
+        let tokens_generated = generated_ids.len();
+
         let text = self
             .tokenizer
-            .decode(&output_ids, true)
+            .decode(&generated_ids, true)
             .map_err(|e| anyhow::anyhow!("Decoding failed: {}", e))?;
 
-        Ok(text)
+        Ok((text, tokens_generated))
     }
 
     /// Get model configuration

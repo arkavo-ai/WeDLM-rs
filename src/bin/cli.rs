@@ -320,7 +320,7 @@ fn main() -> Result<()> {
 
             eprintln!("\nGenerating...");
             let gen_start = Instant::now();
-            let output = if autoregressive {
+            let (output, token_count) = if autoregressive {
                 engine.generate_autoregressive(&prompt, max_tokens, temperature)?
             } else {
                 let params = preset.to_params(temperature);
@@ -329,9 +329,6 @@ fn main() -> Result<()> {
             };
             let gen_time = gen_start.elapsed();
 
-            let prompt_len = prompt.len();
-            let output_only = &output[prompt_len..].trim();
-            let token_count = output_only.split_whitespace().count().max(1);
             let tokens_per_sec = token_count as f64 / gen_time.as_secs_f64();
 
             eprintln!("\n--- Output ---");
@@ -340,7 +337,7 @@ fn main() -> Result<()> {
             eprintln!("\n--- Stats ---");
             eprintln!("Preset: {:?}", preset);
             eprintln!("TTS (time to generate): {:.2}s", gen_time.as_secs_f64());
-            eprintln!("Tokens generated: ~{}", token_count);
+            eprintln!("Tokens generated: {}", token_count);
             eprintln!("Speed: {:.1} tok/s", tokens_per_sec);
         }
 
@@ -436,16 +433,18 @@ fn main() -> Result<()> {
             // Benchmark autoregressive
             println!("Benchmarking autoregressive...");
             let mut ar_times = Vec::with_capacity(runs);
+            let mut ar_token_counts = Vec::with_capacity(runs);
             for i in 0..runs {
                 let start = Instant::now();
-                let _output = engine.generate_autoregressive(prompt, tokens, temperature)?;
+                let (_output, token_count) = engine.generate_autoregressive(prompt, tokens, temperature)?;
                 let elapsed = start.elapsed();
                 ar_times.push(elapsed);
+                ar_token_counts.push(token_count);
                 println!(
                     "  Run {}: {:.2}s ({:.1} tok/s)",
                     i + 1,
                     elapsed.as_secs_f64(),
-                    tokens as f64 / elapsed.as_secs_f64()
+                    token_count as f64 / elapsed.as_secs_f64()
                 );
             }
 
@@ -458,21 +457,22 @@ fn main() -> Result<()> {
             // Benchmark WeDLM with quality metrics
             println!("Benchmarking WeDLM parallel...");
             let mut wedlm_times = Vec::with_capacity(runs);
+            let mut wedlm_token_counts = Vec::with_capacity(runs);
             let mut quality_results: Vec<QualityMetrics> = Vec::with_capacity(runs);
             let mut last_output = String::new();
 
             for i in 0..runs {
                 let start = Instant::now();
-                let output =
+                let (output, token_count) =
                     engine.generate_with_block_size(prompt, tokens, bs, Some(params.clone()))?;
                 let elapsed = start.elapsed();
                 wedlm_times.push(elapsed);
+                wedlm_token_counts.push(token_count);
                 last_output = output.clone();
 
-                // Compute quality metrics
-                let output_only = &output[prompt.len()..];
-                let output_tokens: Vec<u32> = output_only.chars().map(|c| c as u32).collect();
-                let metrics = QualityMetrics::compute(&output_tokens, output_only);
+                // Compute quality metrics on generated output
+                let output_tokens: Vec<u32> = output.chars().map(|c| c as u32).collect();
+                let metrics = QualityMetrics::compute(&output_tokens, &output);
                 let quality_str = if no_quality_check {
                     String::new()
                 } else {
@@ -490,7 +490,7 @@ fn main() -> Result<()> {
                     "  Run {}: {:.2}s ({:.1} tok/s){}",
                     i + 1,
                     elapsed.as_secs_f64(),
-                    tokens as f64 / elapsed.as_secs_f64(),
+                    token_count as f64 / elapsed.as_secs_f64(),
                     quality_str
                 );
             }
@@ -498,23 +498,24 @@ fn main() -> Result<()> {
             // Show sample output
             if !no_quality_check {
                 println!("\n--- Sample Output (first 200 chars) ---");
-                let sample = &last_output[prompt.len()..];
-                let sample_truncated: String = sample.chars().take(200).collect();
+                let sample_truncated: String = last_output.chars().take(200).collect();
                 println!("{}", sample_truncated);
-                if sample.len() > 200 {
+                if last_output.len() > 200 {
                     println!("...");
                 }
             }
 
-            // Calculate averages
-            let ar_avg: f64 =
+            // Calculate averages using actual token counts
+            let ar_avg_time: f64 =
                 ar_times.iter().map(|t| t.as_secs_f64()).sum::<f64>() / runs as f64;
-            let wedlm_avg: f64 =
+            let wedlm_avg_time: f64 =
                 wedlm_times.iter().map(|t| t.as_secs_f64()).sum::<f64>() / runs as f64;
+            let ar_avg_tokens: f64 = ar_token_counts.iter().sum::<usize>() as f64 / runs as f64;
+            let wedlm_avg_tokens: f64 = wedlm_token_counts.iter().sum::<usize>() as f64 / runs as f64;
 
-            let ar_tok_per_sec = tokens as f64 / ar_avg;
-            let wedlm_tok_per_sec = tokens as f64 / wedlm_avg;
-            let speedup = ar_avg / wedlm_avg;
+            let ar_tok_per_sec = ar_avg_tokens / ar_avg_time;
+            let wedlm_tok_per_sec = wedlm_avg_tokens / wedlm_avg_time;
+            let speedup = ar_avg_time / wedlm_avg_time;
 
             // Quality summary
             let passed_count = quality_results.iter().filter(|m| m.passed).count();
@@ -522,11 +523,11 @@ fn main() -> Result<()> {
             println!("\n=== Results ===");
             println!(
                 "Autoregressive:  {:.2}s avg ({:.1} tok/s)",
-                ar_avg, ar_tok_per_sec
+                ar_avg_time, ar_tok_per_sec
             );
             println!(
                 "WeDLM Parallel:  {:.2}s avg ({:.1} tok/s)",
-                wedlm_avg, wedlm_tok_per_sec
+                wedlm_avg_time, wedlm_tok_per_sec
             );
 
             if !no_quality_check {
@@ -585,9 +586,9 @@ fn main() -> Result<()> {
             // First get autoregressive baseline
             println!("Getting autoregressive baseline...");
             let ar_start = Instant::now();
-            let _output = engine.generate_autoregressive(prompt, tokens, temperature)?;
+            let (_output, ar_token_count) = engine.generate_autoregressive(prompt, tokens, temperature)?;
             let ar_time = ar_start.elapsed().as_secs_f64();
-            let ar_tok_per_sec = tokens as f64 / ar_time;
+            let ar_tok_per_sec = ar_token_count as f64 / ar_time;
             println!(
                 "Autoregressive: {:.2}s ({:.1} tok/s)\n",
                 ar_time, ar_tok_per_sec
@@ -623,21 +624,20 @@ fn main() -> Result<()> {
                         };
 
                         let start = Instant::now();
-                        let output = engine.generate_with_block_size(
+                        let (output, token_count) = engine.generate_with_block_size(
                             prompt,
                             tokens,
                             block_size,
                             Some(params),
                         )?;
                         let elapsed = start.elapsed().as_secs_f64();
-                        let tok_per_sec = tokens as f64 / elapsed;
+                        let tok_per_sec = token_count as f64 / elapsed;
                         let speedup = ar_time / elapsed;
 
-                        // Quality check
-                        let output_only = &output[prompt.len()..];
+                        // Quality check on generated output
                         let output_tokens: Vec<u32> =
-                            output_only.chars().map(|c| c as u32).collect();
-                        let quality = QualityMetrics::compute(&output_tokens, output_only);
+                            output.chars().map(|c| c as u32).collect();
+                        let quality = QualityMetrics::compute(&output_tokens, &output);
 
                         println!(
                             "{:>7.2} {:>6.2} {:>8} {:>7.1} {:>6.2}x {:>7} {:>6}",
