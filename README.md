@@ -155,23 +155,40 @@ cargo build --release --no-default-features --features cuda
 
 ## Performance Tuning
 
-### Metal Command Buffer Batching
+### Benchmarks
 
-On Apple Silicon, you can improve throughput by increasing the number of compute operations batched per Metal command buffer:
+| Hardware | GPU Cores | RAM | Preset | WeDLM | AR | Speedup |
+|----------|-----------|-----|--------|-------|-----|---------|
+| M1 Max | 32 | 32GB | Balanced | 11.3 tok/s | 4.5 tok/s | 2.5x |
+| M4 Max | 40 | 128GB | Balanced | 22.4 tok/s | 5.8 tok/s | 3.9x |
+| M4 Max | 40 | 128GB | Fast | 71.2 tok/s | 5.8 tok/s | 12.2x |
+
+### Presets
+
+Presets are tuned for Apple Silicon unified memory architecture:
+
+| Preset | Entropy (τ) | Lambda (λ) | Max/Step | Speed | Quality |
+|--------|-------------|------------|----------|-------|---------|
+| `quality` | 0.5 | 0.10 | 4 | ~18 tok/s | Best |
+| `balanced` | 0.8 | 0.05 | 8 | ~22 tok/s | Good |
+| `fast` | 1.0 | 0.05 | 6 | ~71 tok/s | Acceptable |
 
 ```bash
-CANDLE_METAL_COMPUTE_PER_BUFFER=200 ./target/release/wedlm-cli generate \
+# Use fast preset for maximum speed
+./target/release/wedlm-cli generate \
   -m tencent/WeDLM-8B-Instruct \
-  -p "Your prompt here"
+  -p "Your prompt" \
+  --preset fast
 ```
 
-| Setting | Default | Optimized |
-|---------|---------|-----------|
-| `CANDLE_METAL_COMPUTE_PER_BUFFER` | 50 | 200 |
-| WeDLM Throughput | ~10 tok/s | ~11 tok/s (+10%) |
-| AR Throughput | ~4.0 tok/s | ~4.5 tok/s (+12%) |
+### Theoretical Limits
 
-> **Note**: Tested on M1 Max (32-core GPU, 32GB). Optimal value may vary by GPU.
+On Apple Silicon with unified memory:
+- Model size: 8B params × 2 bytes (FP16) = 16 GB
+- M4 Max bandwidth: ~400 GB/s
+- **Theoretical max: ~150-200 tok/s** (limited by memory bandwidth)
+
+To exceed this, quantization (INT4/INT8) would be required.
 
 ---
 

@@ -97,14 +97,15 @@ impl QualityMetrics {
 // ============================================================================
 
 /// Preset configurations for quality/speed tradeoff
+/// Tuned for Apple Silicon unified memory - sweep found λ=0.05 optimal
 #[derive(Clone, Copy, Debug, ValueEnum, Default)]
 enum Preset {
-    /// High quality, lower speed (max_per_step=2, entropy=0.4, λ=0.25)
+    /// High quality (~18 tok/s): entropy=0.5, λ=0.10, max=4
     Quality,
-    /// Balanced quality and speed (max_per_step=6, entropy=0.8, λ=0.15)
+    /// Balanced (~22 tok/s): entropy=0.8, λ=0.05, max=8
     #[default]
     Balanced,
-    /// Maximum speed, lower quality (max_per_step=16, entropy=1.5, λ=0.05)
+    /// Maximum speed (~71 tok/s): entropy=1.0, λ=0.05, max=6
     Fast,
 }
 
@@ -113,23 +114,23 @@ impl Preset {
         match self {
             Preset::Quality => SamplingParams {
                 temperature,
-                entropy_threshold: 0.4,
-                distance_penalty: 0.25,
-                max_tokens_per_step: 2,
+                entropy_threshold: 0.5,
+                distance_penalty: 0.10,
+                max_tokens_per_step: 4,
                 ..Default::default()
             },
             Preset::Balanced => SamplingParams {
                 temperature,
                 entropy_threshold: 0.8,
-                distance_penalty: 0.15,
-                max_tokens_per_step: 6,
+                distance_penalty: 0.05,
+                max_tokens_per_step: 8,
                 ..Default::default()
             },
             Preset::Fast => SamplingParams {
                 temperature,
-                entropy_threshold: 1.5,
+                entropy_threshold: 1.0,
                 distance_penalty: 0.05,
-                max_tokens_per_step: 16,
+                max_tokens_per_step: 6,
                 ..Default::default()
             },
         }
@@ -139,7 +140,7 @@ impl Preset {
         match self {
             Preset::Quality => 16,
             Preset::Balanced => 32,
-            Preset::Fast => 64,
+            Preset::Fast => 32,
         }
     }
 }
